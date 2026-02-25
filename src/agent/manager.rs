@@ -7,7 +7,6 @@ use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1001,10 +1000,11 @@ impl AgentManager {
                     tracing::debug!(elapsed_ms = elapsed.as_millis(), "vsock socket appeared");
                 }
 
-                match UnixStream::connect(&self.vsock_socket) {
-                    Ok(stream) => {
-                        drop(stream);
-
+                // Connect and ping in one shot — no connect-drop-reconnect.
+                // Use a short read timeout so stale connections fail fast
+                // instead of blocking for ~5s on Linux.
+                match super::AgentClient::connect(&self.vsock_socket) {
+                    Ok(mut client) => {
                         // Log when first connect succeeds
                         if first_connect_at.is_none() {
                             let elapsed = start.elapsed();
@@ -1015,21 +1015,22 @@ impl AgentManager {
                             );
                         }
 
-                        // Try to ping
-                        match super::AgentClient::connect(&self.vsock_socket) {
-                            Ok(mut client) => {
-                                if client.ping().is_ok() {
-                                    let total = start.elapsed();
-                                    tracing::info!(
-                                        total_ms = total.as_millis(),
-                                        socket_wait_ms =
-                                            socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
-                                        connect_wait_ms =
-                                            first_connect_at.map(|d| d.as_millis()).unwrap_or(0),
-                                        "agent ready - timing breakdown"
-                                    );
-                                    return Ok(());
-                                }
+                        // Set a short read timeout for the ping so we fail fast
+                        // if the guest agent isn't ready yet (avoids ~5s stall on Linux)
+                        let _ = client.set_read_timeout(Duration::from_millis(500));
+
+                        match client.ping() {
+                            Ok(_) => {
+                                let total = start.elapsed();
+                                tracing::info!(
+                                    total_ms = total.as_millis(),
+                                    socket_wait_ms =
+                                        socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
+                                    connect_wait_ms =
+                                        first_connect_at.map(|d| d.as_millis()).unwrap_or(0),
+                                    "agent ready - timing breakdown"
+                                );
+                                return Ok(());
                             }
                             Err(e) => {
                                 tracing::trace!("ping failed: {}", e);

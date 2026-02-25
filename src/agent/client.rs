@@ -45,9 +45,11 @@ const INTERACTIVE_TIMEOUT_SECS: u64 = 3600;
 /// timeout to allow for protocol overhead and response transmission.
 const TIMEOUT_BUFFER_SECS: u64 = 5;
 
-/// Short read timeout for status checks (5 seconds).
+/// Short read timeout for status checks (1 second).
 /// Used when checking agent status where we want to fail fast.
-const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;
+/// The shutdown ack is best-effort — if it hasn't arrived within 1s,
+/// the VM was torn down and sync already completed.
+const STATUS_CHECK_TIMEOUT_SECS: u64 = 1;
 
 // ============================================================================
 // I/O Constants
@@ -279,7 +281,7 @@ impl AgentClient {
     ///
     /// This is a helper to ensure timeout failures are always handled properly,
     /// preventing indefinite hangs on read operations.
-    fn set_read_timeout(&self, timeout: Duration) -> Result<()> {
+    pub(crate) fn set_read_timeout(&self, timeout: Duration) -> Result<()> {
         self.stream.set_read_timeout(Some(timeout)).map_err(|e| {
             Error::agent(
                 "set read timeout",
