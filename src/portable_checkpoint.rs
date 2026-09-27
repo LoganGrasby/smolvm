@@ -1516,9 +1516,12 @@ fn capture_with_completion(
         &mut phase,
     );
     // The source is quiesced: its disks are what the checkpoint captures.
+    #[cfg(unix)]
     let captured_disks = stop_after_capture
         .then(|| disk_chain_identity(&crate::agent::vm_data_dir(name)))
         .transpose()?;
+    #[cfg(not(unix))]
+    let captured_disks: Option<String> = None;
     let checkpoint_disks = stage_disk_chains_with(
         &crate::agent::vm_data_dir(name),
         &snapshot_dir,
@@ -2808,6 +2811,7 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
 /// The status change time of a backing only the service can write, such as a
 /// storage template, is left out: staging hard-links raw backings, which
 /// changes it.
+#[cfg(unix)]
 fn disk_chain_identity(vm_data: &Path) -> Result<String> {
     use std::fmt::Write as _;
     use std::os::unix::fs::MetadataExt;
@@ -2862,6 +2866,7 @@ fn disk_chain_identity(vm_data: &Path) -> Result<String> {
 /// After a pause has stopped the machine, record that its own disk chains are
 /// still exactly what the checkpoint captured, so resume can keep them rather
 /// than install the checkpoint's copies. Nothing is recorded if they changed.
+#[cfg(unix)]
 fn record_paused_disks(vm_data: &Path, artifact: &Path, captured: Option<&str>) {
     let Some(captured) = captured else {
         return;
@@ -2921,6 +2926,7 @@ fn remove_paused_disks_marker(vm_data: &Path) -> Result<()> {
 /// Whether a paused machine's own disk chains are still the ones `artifact`
 /// captured: recorded when it stopped, unchanged since, and shaped as the
 /// checkpoint's chains are.
+#[cfg(unix)]
 fn paused_disks_intact(vm_data: &Path, artifact: &Path, disks: &[CheckpointDisk]) -> bool {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let Ok(marker) = paused_disks_marker(vm_data) else {
@@ -2971,6 +2977,15 @@ fn paused_disks_intact(vm_data: &Path, artifact: &Path, disks: &[CheckpointDisk]
         })
         .collect();
     shape == expected
+}
+
+/// Without Unix file identities there is no record: resume installs disks.
+#[cfg(not(unix))]
+fn record_paused_disks(_vm_data: &Path, _artifact: &Path, _captured: Option<&str>) {}
+
+#[cfg(not(unix))]
+fn paused_disks_intact(_vm_data: &Path, _artifact: &Path, _disks: &[CheckpointDisk]) -> bool {
+    false
 }
 
 /// Stage exact, self-contained disk chains without flattening them.
@@ -3103,6 +3118,7 @@ fn stage_disk_chains_with(
 /// crash may have lost it, so none is synced. Idle copies beyond the newest
 /// few are removed. `Ok(false)` means there is no cache here; the caller
 /// stages a private copy as before.
+#[cfg(unix)]
 fn stage_shared_backing(source: &Path, staged: &Path, next_target: Option<&str>) -> Result<bool> {
     let Some(cache) = dirs::cache_dir() else {
         return Ok(false);
@@ -3115,6 +3131,7 @@ fn stage_shared_backing(source: &Path, staged: &Path, next_target: Option<&str>)
     )
 }
 
+#[cfg(unix)]
 fn stage_shared_backing_in(
     cache: &Path,
     source: &Path,
@@ -3202,6 +3219,16 @@ fn stage_shared_backing_in(
         }
     }
     Ok(true)
+}
+
+/// Without a boot identity for the cache, every checkpoint stages its own copy.
+#[cfg(not(unix))]
+fn stage_shared_backing(
+    _source: &Path,
+    _staged: &Path,
+    _next_target: Option<&str>,
+) -> Result<bool> {
+    Ok(false)
 }
 
 fn stage_checkpoint_disk_layer(
@@ -5270,6 +5297,7 @@ mod tests {
         assert_ne!(inode(&other), inode(&third));
     }
 
+    #[cfg(unix)]
     #[test]
     fn paused_disks_are_kept_only_while_unchanged() {
         let dir = tempfile::tempdir().unwrap();
