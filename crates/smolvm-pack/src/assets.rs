@@ -269,6 +269,97 @@ fn compression_workers(parallelism: usize) -> u32 {
     }
 }
 
+/// Where an agent rootfs tar built from `rootfs_dir` as it is now is kept, so
+/// later packs can reuse it. The name is a digest of every entry's path, type,
+/// size, mode, owner, inode and change time: any change to the tree, including
+/// a reinstall, gives a new name. `None` when the tree cannot be read.
+fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    fn walk(dir: &Path, relative: &Path, top: bool, hash: &mut Sha256) -> std::io::Result<()> {
+        let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            // Skipped by the tar too: host-side readiness markers.
+            if top
+                && name
+                    .to_string_lossy()
+                    .starts_with(smolvm_protocol::AGENT_READY_MARKER)
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let relative = relative.join(&name);
+            hash.update(relative.to_string_lossy().as_bytes());
+            hash.update([0]);
+            #[cfg(unix)]
+            {
+                for value in [
+                    metadata.mode() as u64,
+                    metadata.uid() as u64,
+                    metadata.gid() as u64,
+                    metadata.size(),
+                    metadata.ino(),
+                    metadata.ctime() as u64,
+                    metadata.ctime_nsec() as u64,
+                    metadata.mtime() as u64,
+                    metadata.mtime_nsec() as u64,
+                ] {
+                    hash.update(value.to_le_bytes());
+                }
+            }
+            #[cfg(not(unix))]
+            hash.update(metadata.len().to_le_bytes());
+            if metadata.file_type().is_symlink() {
+                hash.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
+            } else if metadata.is_dir() {
+                walk(&path, &relative, false, hash)?;
+            }
+        }
+        Ok(())
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"agent-rootfs-tar-v1\0");
+    walk(rootfs_dir, Path::new(""), true, &mut hash).ok()?;
+    let cache = dirs::cache_dir()?.join("smolvm").join("agent-rootfs-tars");
+    fs::create_dir_all(&cache).ok()?;
+    Some(cache.join(format!("{:x}.tar", hash.finalize())))
+}
+
+/// Keep the tar just built at `built` as `cached` for later packs, and drop
+/// all but the newest few. Best effort: a failure only costs a rebuild.
+fn publish_agent_rootfs_tar(built: &Path, cached: &Path) {
+    const KEEP: usize = 4;
+    let Some(dir) = cached.parent() else {
+        return;
+    };
+    let temporary = dir.join(format!(
+        ".{}.{}",
+        cached.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&temporary);
+    if fs::hard_link(built, &temporary).is_err() || fs::rename(&temporary, cached).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut tars: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tar"))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect();
+    tars.sort_by_key(|tar| std::cmp::Reverse(tar.0));
+    for (_, path) in tars.into_iter().skip(KEEP) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// Find a pre-formatted disk template by filename.
 ///
 /// Searches in order:
@@ -430,6 +521,9 @@ pub const WORKSPACE_SEED_FILE: &str = "workspace.tar";
 pub struct AssetCollector {
     staging_dir: PathBuf,
     inventory: AssetInventory,
+    /// Link host assets into staging instead of copying them. Only for a
+    /// staging tree that is packed and then discarded unchanged.
+    link_host_assets: bool,
 }
 
 impl AssetCollector {
@@ -453,7 +547,29 @@ impl AssetCollector {
                 overlay_logical_size: None,
                 workspace_seed: None,
             },
+            link_host_assets: false,
         })
+    }
+
+    /// Hard-link the libraries and storage template into staging, and reuse
+    /// an agent rootfs tar built earlier from the same tree, instead of
+    /// writing fresh copies. Use only when the staging tree is packed and then
+    /// discarded: nothing may modify a staged file in place.
+    pub fn with_linked_host_assets(mut self) -> Self {
+        self.link_host_assets = true;
+        self
+    }
+
+    /// Stage `src` at `dst`: a hard link when enabled and possible, else a copy.
+    /// Like the copy, the link is to the file a symlink names.
+    fn stage_host_file(&self, src: &Path, dst: &Path) -> Result<()> {
+        if self.link_host_assets
+            && fs::canonicalize(src).is_ok_and(|file| fs::hard_link(file, dst).is_ok())
+        {
+            return Ok(());
+        }
+        fs::copy(src, dst)?;
+        Ok(())
     }
 
     /// Get the staging directory path.
@@ -497,7 +613,7 @@ impl AssetCollector {
             }
 
             let dst = self.staging_dir.join("lib").join(name);
-            fs::copy(&src, &dst)?;
+            self.stage_host_file(&src, &dst)?;
 
             let metadata = fs::metadata(&dst)?;
             self.inventory.libraries.push(AssetEntry {
@@ -577,6 +693,22 @@ impl AssetCollector {
         }
 
         let tar_path = self.staging_dir.join("agent-rootfs.tar");
+        let cached = if self.link_host_assets {
+            agent_rootfs_tar_cache(rootfs_dir)
+        } else {
+            None
+        };
+        if cached
+            .as_ref()
+            .is_some_and(|cached| fs::hard_link(cached, &tar_path).is_ok())
+        {
+            let metadata = fs::metadata(&tar_path)?;
+            self.inventory.agent_rootfs = AssetEntry {
+                path: "agent-rootfs.tar".to_string(),
+                size: metadata.len(),
+            };
+            return Ok(());
+        }
         let tar_file = File::create(&tar_path)?;
         let mut tar_builder = tar::Builder::new(BufWriter::new(tar_file));
 
@@ -617,9 +749,17 @@ impl AssetCollector {
             }
         }
 
-        tar_builder
-            .finish()
-            .map_err(|e| PackError::Tar(e.to_string()))?;
+        let tar_file = tar_builder
+            .into_inner()
+            .map_err(|e| PackError::Tar(e.to_string()))?
+            .into_inner()
+            .map_err(|e| PackError::Io(e.into_error()))?;
+        if let Some(cached) = &cached {
+            // Later packs trust the cached tar as complete.
+            tar_file.sync_all()?;
+            publish_agent_rootfs_tar(&tar_path, cached);
+        }
+        drop(tar_file);
 
         let metadata = fs::metadata(&tar_path)?;
         self.inventory.agent_rootfs = AssetEntry {
@@ -729,7 +869,12 @@ impl AssetCollector {
             // (multi-GiB) sparse file, and a plain fs::copy densifies it into its
             // full logical size of zeros on some Linux filesystems/mounts —
             // ballooning the staging dir and failing pack builds with ENOSPC.
-            crate::extract::sparse_copy(&existing, &template_path)?;
+            if !(self.link_host_assets
+                && fs::canonicalize(&existing)
+                    .is_ok_and(|file| fs::hard_link(file, &template_path).is_ok()))
+            {
+                crate::extract::sparse_copy(&existing, &template_path)?;
+            }
             let metadata = fs::metadata(&template_path)?;
             self.inventory.storage_template = Some(AssetEntry {
                 path: TEMPLATE_NAME.to_string(),

@@ -835,6 +835,19 @@ fn safe_unpack_with_policy<R: Read>(
     checkpoint: bool,
     owner_xattr: bool,
 ) -> std::io::Result<UnpackReport> {
+    safe_unpack_skipping(archive, dest, limits, checkpoint, owner_xattr, &[])
+}
+
+/// [`safe_unpack_with_policy`], leaving out the archive paths in `skip` and
+/// everything under them.
+fn safe_unpack_skipping<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    limits: &SafeUnpackLimits,
+    checkpoint: bool,
+    owner_xattr: bool,
+    skip: &[PathBuf],
+) -> std::io::Result<UnpackReport> {
     let mut report = UnpackReport::default();
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
     // matches the per-entry `normalized` paths, which are built from this same
@@ -874,6 +887,12 @@ fn safe_unpack_with_policy<R: Read>(
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
         let entry_path = entry.path()?.to_path_buf();
+        if skip
+            .iter()
+            .any(|skip| normalize_path(&entry_path).starts_with(skip))
+        {
+            continue;
+        }
         // RAM is a host runtime input, not a guest filesystem entry. Never
         // restore the exporting VMM's UID onto this shared cache object.
         let host_memory =
@@ -2462,6 +2481,36 @@ pub fn unpack_checkpoint_history(
         &SafeUnpackLimits::from_env(),
         false,
         false,
+    )?;
+    Ok(())
+}
+
+/// Extract a checkpoint sidecar's assets into `dest`, leaving out the archive
+/// paths in `skip` and everything under them.
+///
+/// For a restore that installs only some of the assets: a pause checkpoint
+/// also carries the runtime libraries, agent rootfs and storage template, so
+/// the checkpoint can move to another host, but resuming it here uses the
+/// host's own. Unlike [`extract_sidecar`] this writes no cache markers and
+/// does no layer post-processing.
+pub fn extract_checkpoint_sidecar(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    let decoder = zstd::stream::Decoder::new(File::open(sidecar_path)?.take(footer.assets_size))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut archive = tar::Archive::new(decoder);
+    let skip: Vec<PathBuf> = skip.iter().map(|path| normalize_path(path)).collect();
+    safe_unpack_skipping(
+        &mut archive,
+        dest,
+        &SafeUnpackLimits::from_env(),
+        true,
+        false,
+        &skip,
     )?;
     Ok(())
 }

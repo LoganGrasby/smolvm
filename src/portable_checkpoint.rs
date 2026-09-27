@@ -46,6 +46,79 @@ const PENDING_MARKER: &str = "pending";
 const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 pub(crate) const READONLY_INPUT_DIR: &str = ".restore-input";
 const READONLY_INPUT_MARKER: &str = "readonly-memory";
+/// Service-owned tmpfs directory where a resume stages its checkpoint, so the
+/// RAM image it hands the VMM is never written to disk.
+#[cfg(target_os = "linux")]
+const RESTORE_TMPFS_ROOT: &str = "/dev/shm/smolvm-restore";
+
+/// [`RESTORE_TMPFS_ROOT`], created if needed, when it is usable: the service
+/// runs as root, `/dev/shm` is tmpfs, and the directory is root-owned mode
+/// 0700. `SMOLVM_RESTORE_TMPFS=0` disables it.
+#[cfg(target_os = "linux")]
+fn restore_tmpfs_root() -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    if std::env::var_os("SMOLVM_RESTORE_TMPFS").is_some_and(|value| value == "0")
+        || unsafe { libc::geteuid() } != 0
+    {
+        return None;
+    }
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut stat) } != 0
+        || stat.f_type != libc::TMPFS_MAGIC
+    {
+        return None;
+    }
+    let root = PathBuf::from(RESTORE_TMPFS_ROOT);
+    match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    restore_tmpfs_root_is_trusted(&root).then_some(root)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_tmpfs_root_is_trusted(root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(root).is_ok_and(|metadata| {
+        metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o777 == 0o700
+    })
+}
+
+/// Bytes free in the filesystem holding `path`.
+#[cfg(target_os = "linux")]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0)
+        .then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// Where a machine's read-only restore RAM input may live: its data directory,
+/// or the restore tmpfs when the checkpoint was staged there.
+fn readonly_input_dirs(vm_dir: &Path) -> Vec<PathBuf> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut dirs = vec![vm_dir.join(READONLY_INPUT_DIR)];
+    #[cfg(target_os = "linux")]
+    if let Some(name) = vm_dir.file_name() {
+        let mut tmpfs_name = name.to_os_string();
+        tmpfs_name.push(READONLY_INPUT_DIR);
+        dirs.push(Path::new(RESTORE_TMPFS_ROOT).join(tmpfs_name));
+    }
+    dirs
+}
+
+fn remove_readonly_input(vm_dir: &Path) -> std::io::Result<()> {
+    for dir in readonly_input_dirs(vm_dir) {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 fn readonly_restore_supported() -> bool {
@@ -79,10 +152,21 @@ fn stage_readonly_memory(source: &Path, vm_dir: &Path, asset: &CheckpointAsset) 
     if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
         return Ok(false);
     }
+    // An image extracted onto the restore tmpfs stays there: linking it into
+    // the data directory would cross filesystems and fall back to a disk copy.
+    let tmpfs = restore_tmpfs_root()
+        .filter(|root| std::fs::metadata(root).is_ok_and(|root| root.dev() == metadata.dev()));
+    let [on_disk, on_tmpfs]: [PathBuf; 2] = readonly_input_dirs(vm_dir)
+        .try_into()
+        .expect("disk and tmpfs input directories");
+    let (parent, destination) = match &tmpfs {
+        Some(root) => (root.as_path(), on_tmpfs),
+        None => (vm_dir, on_disk),
+    };
     let staging = tempfile::Builder::new()
         .prefix(".restore-input-")
         .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir_in(vm_dir)?;
+        .tempdir_in(parent)?;
     let input = staging.path().join("memory.bin");
     match std::fs::hard_link(source, &input) {
         Ok(()) => {}
@@ -93,12 +177,14 @@ fn stage_readonly_memory(source: &Path, vm_dir: &Path, asset: &CheckpointAsset) 
     // restart between import and start. Subsequent cache hits sync clean pages.
     std::fs::File::open(&input)?.sync_all()?;
     std::fs::File::open(staging.path())?.sync_all()?;
-    let destination = vm_dir.join(READONLY_INPUT_DIR);
-    if destination.exists() {
+    if readonly_input_dirs(vm_dir)
+        .iter()
+        .any(|dir| std::fs::symlink_metadata(dir).is_ok())
+    {
         return Err(Error::agent("retain restore RAM", "input already exists"));
     }
     std::fs::rename(staging.path(), &destination)?;
-    std::fs::File::open(vm_dir)?.sync_all()?;
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(true)
 }
 
@@ -114,10 +200,26 @@ pub(crate) fn open_readonly_memory(vm_dir: &Path) -> Result<std::fs::File> {
         fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     };
+    let [on_disk, on_tmpfs]: [PathBuf; 2] = readonly_input_dirs(vm_dir)
+        .try_into()
+        .expect("disk and tmpfs input directories");
+    let input_dir = if std::fs::symlink_metadata(&on_disk).is_err()
+        && std::fs::symlink_metadata(&on_tmpfs).is_ok()
+    {
+        if !restore_tmpfs_root_is_trusted(Path::new(RESTORE_TMPFS_ROOT)) {
+            return Err(Error::agent(
+                "open restore RAM",
+                "restore tmpfs must be service-owned mode 0700",
+            ));
+        }
+        on_tmpfs
+    } else {
+        on_disk
+    };
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(vm_dir.join(READONLY_INPUT_DIR))?;
+        .open(input_dir)?;
     let metadata = directory.metadata()?;
     if metadata.uid() != 0 || metadata.mode() & 0o777 != 0o700 {
         return Err(Error::agent(
@@ -175,7 +277,7 @@ pub(crate) fn prepare_memory_backend(snapshot: &Path, branchable: bool) -> Resul
         std::fs::File::open(snapshot)?.sync_all()?;
         std::fs::remove_file(snapshot.join(READONLY_INPUT_MARKER))?;
         std::fs::File::open(snapshot)?.sync_all()?;
-        std::fs::remove_dir_all(vm_dir.join(READONLY_INPUT_DIR))?;
+        remove_readonly_input(vm_dir)?;
         std::fs::File::open(vm_dir)?.sync_all()?;
         Ok(())
     }
@@ -1275,6 +1377,15 @@ fn capture_with_completion(
     let staging_dir = temp_dir.path().join("staging");
     let mut collector = AssetCollector::new(staging_dir.clone())
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
+    // Staging is only packed and discarded unless a store ingests it or the
+    // prepared cache retains it; then the host's asset files can be linked in.
+    if stored.is_none()
+        && !options
+            .prepared_cache_budget_bytes
+            .is_some_and(|bytes| bytes > 0)
+    {
+        collector = collector.with_linked_host_assets();
+    }
     collector
         .collect_libraries(&checkpoint_lib_dir(options)?)
         .map_err(|error| Error::agent("collect checkpoint libraries", error.to_string()))?;
@@ -1341,16 +1452,28 @@ fn capture_with_completion(
     // intact for the source to keep executing after the checkpoint.
     let use_deferred_save =
         !cfg!(all(target_os = "linux", target_arch = "x86_64")) || vm.source_smolmachine.is_none();
-    let command = if use_deferred_save {
-        "PREPARE_SAVE"
-    } else {
+    // A capture that stops the VM keeps it paused until the RAM is written, so
+    // libkrun can read RAM it cannot retain as a generation (a fork clone's)
+    // in place instead of falling back to a synchronous save.
+    let command = if !use_deferred_save {
         "SAVE"
+    } else if stop_after_capture {
+        "PREPARE_SAVE_HELD"
+    } else {
+        "PREPARE_SAVE"
     };
     let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
         &control,
         &format!("{command} {}", runtime_snapshot.display()),
         std::time::Duration::from_secs(30 * 60),
     )?;
+    if command == "PREPARE_SAVE_HELD" && reply.trim() == "ERR EINVAL unknown command" {
+        reply = crate::agent::fork::control_socket_cmd_with_timeout(
+            &control,
+            &format!("PREPARE_SAVE {}", runtime_snapshot.display()),
+            std::time::Duration::from_secs(30 * 60),
+        )?;
+    }
     let prepared = use_deferred_save && reply.starts_with("OK");
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     if !prepared
@@ -3569,7 +3692,7 @@ pub fn install(
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&partial);
         let _ = std::fs::remove_dir_all(&destination);
-        let _ = std::fs::remove_dir_all(vm_data_dir.join(READONLY_INPUT_DIR));
+        let _ = remove_readonly_input(vm_data_dir);
     }
     result
 }
@@ -3630,13 +3753,47 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .ok_or_else(|| Error::agent("resume machine", "artifact has no execution state"))?;
     validate_compatibility(checkpoint)?;
     let vm_data = crate::agent::vm_data_dir(&record.name);
-    let staged = tempfile::Builder::new()
-        .prefix("resume-")
-        .tempdir_in(&vm_data)?;
-    smolvm_pack::extract::extract_sidecar(artifact, staged.path(), &footer, false, false)
-        .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
-    clear_stale_restore_state(&vm_data)?;
-    install(staged.path(), &vm_data, checkpoint)
+    // Resuming here uses this host's runtime, so the libraries, agent rootfs
+    // and storage template the artifact carries for other hosts stay packed.
+    let mut skip: Vec<PathBuf> = manifest
+        .assets
+        .libraries
+        .iter()
+        .map(|asset| PathBuf::from(&asset.path))
+        .collect();
+    skip.push(PathBuf::from("lib"));
+    skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
+    if let Some(template) = &manifest.assets.storage_template {
+        skip.push(PathBuf::from(&template.path));
+    }
+    let extract_and_install = |parent: &Path| -> Result<()> {
+        let staged = tempfile::Builder::new()
+            .prefix("resume-")
+            .tempdir_in(parent)?;
+        smolvm_pack::extract::extract_checkpoint_sidecar(artifact, staged.path(), &footer, &skip)
+            .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
+        clear_stale_restore_state(&vm_data)?;
+        install(staged.path(), &vm_data, checkpoint)
+    };
+    // Stage on tmpfs when there is room, so the RAM image handed to the VMM
+    // is never written to disk. Its RAM is freed once the VMM has read it.
+    #[cfg(target_os = "linux")]
+    if let Some(root) = restore_tmpfs_root() {
+        let needed = footer
+            .assets_size
+            .saturating_mul(4)
+            .saturating_add(64 << 20);
+        if free_bytes(&root).is_some_and(|free| free >= needed) {
+            match extract_and_install(&root) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(machine = %record.name, %error, "restore on tmpfs failed; staging on disk");
+                    clear_stale_restore_state(&vm_data)?;
+                }
+            }
+        }
+    }
+    extract_and_install(&vm_data)
 }
 
 /// Remove what an earlier restore left in a stopped machine's data dir before
@@ -3646,13 +3803,12 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
 /// and leaving it makes the new restore refuse to retain its own, so a machine
 /// restored from a checkpoint could be paused but never resumed.
 fn clear_stale_restore_state(vm_data: &Path) -> Result<()> {
-    for dir in [INSTALLED_DIR, READONLY_INPUT_DIR] {
-        match std::fs::remove_dir_all(vm_data.join(dir)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+    match std::fs::remove_dir_all(vm_data.join(INSTALLED_DIR)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
+    remove_readonly_input(vm_data)?;
     match std::fs::remove_file(vm_data.join(RETAINED_MEMORY_BACKING)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -3718,7 +3874,7 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
         Error::agent("consume checkpoint", error.to_string())
     })?;
     if readonly_input {
-        if let Err(error) = std::fs::remove_dir_all(vm_data_dir.join(READONLY_INPUT_DIR)) {
+        if let Err(error) = remove_readonly_input(vm_data_dir) {
             tracing::warn!(%error, "checkpoint consumed but retained RAM cleanup failed");
         }
     }
