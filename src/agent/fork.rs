@@ -119,7 +119,7 @@ fn fork_source_lock_path(source: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+pub(crate) fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -131,7 +131,7 @@ fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+pub(crate) fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
     use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -244,6 +244,9 @@ fn fork_source_lock_owner(path: &Path) -> Option<String> {
 ///
 /// Best-effort by design, like [`crate::agent::prune_orphaned_ready_markers`]:
 /// a lock this process cannot open or unlink is simply left in place.
+///
+/// A paused machine's disk record lives beside its data directory for the
+/// same reason, and is removed here too once that directory is gone.
 pub fn prune_orphaned_fork_source_locks() {
     prune_orphaned_fork_source_locks_in(&crate::agent::vm_cache_root());
 }
@@ -254,6 +257,13 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // A paused machine's disk record outlives nothing it describes.
+        if let Some(dir) = crate::portable_checkpoint::paused_disks_marker_owner(&path) {
+            if !vms_dir.join(dir).is_dir() {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
         let Some(source) = fork_source_lock_owner(&path) else {
             continue;
         };
@@ -4181,6 +4191,25 @@ mod tests {
         for f in bystanders {
             assert!(dir.path().join(f).exists(), "{f} must survive the sweep");
         }
+    }
+
+    #[test]
+    fn a_paused_disks_record_is_swept_with_its_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("0123abcd");
+        std::fs::create_dir(&live).unwrap();
+        let kept = dir.path().join(".0123abcd.paused-disks");
+        let orphan = dir.path().join(".4567ef01.paused-disks");
+        std::fs::write(&kept, b"x").unwrap();
+        std::fs::write(&orphan, b"x").unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(kept.exists(), "a live machine's record must survive");
+        assert!(
+            !orphan.exists(),
+            "a deleted machine's record must be removed"
+        );
     }
 
     #[test]

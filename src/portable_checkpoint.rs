@@ -46,6 +46,9 @@ const PENDING_MARKER: &str = "pending";
 const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 pub(crate) const READONLY_INPUT_DIR: &str = ".restore-input";
 const READONLY_INPUT_MARKER: &str = "readonly-memory";
+/// Suffix of the file beside a paused machine's data directory that records
+/// its disk chains' identity once it has stopped.
+const PAUSED_DISKS_SUFFIX: &str = ".paused-disks";
 /// Service-owned tmpfs directory where a resume stages its checkpoint, so the
 /// RAM image it hands the VMM is never written to disk.
 #[cfg(target_os = "linux")]
@@ -1379,11 +1382,11 @@ fn capture_with_completion(
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
     // Staging is only packed and discarded unless a store ingests it or the
     // prepared cache retains it; then the host's asset files can be linked in.
-    if stored.is_none()
+    let discard_staging = stored.is_none()
         && !options
             .prepared_cache_budget_bytes
-            .is_some_and(|bytes| bytes > 0)
-    {
+            .is_some_and(|bytes| bytes > 0);
+    if discard_staging {
         collector = collector.with_linked_host_assets();
     }
     collector
@@ -1443,6 +1446,7 @@ fn capture_with_completion(
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
     if stop_after_capture {
+        remove_paused_disks_marker(&crate::agent::vm_data_dir(name))?;
         publish_resume_point(PauseCaptureStage::Capturing)?;
     }
     let snapshot_dir = staging_dir.join(ASSET_DIR);
@@ -1511,7 +1515,15 @@ fn capture_with_completion(
         },
         &mut phase,
     );
-    let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
+    // The source is quiesced: its disks are what the checkpoint captures.
+    let captured_disks = stop_after_capture
+        .then(|| disk_chain_identity(&crate::agent::vm_data_dir(name)))
+        .transpose()?;
+    let checkpoint_disks = stage_disk_chains_with(
+        &crate::agent::vm_data_dir(name),
+        &snapshot_dir,
+        discard_staging,
+    )?;
     if !stop_after_capture {
         pause.resume()?;
     }
@@ -1841,6 +1853,11 @@ fn capture_with_completion(
         if stop_after_capture {
             publish_resume_point(PauseCaptureStage::Durable)?;
             pause.stop(name, vm)?;
+            record_paused_disks(
+                &crate::agent::vm_data_dir(name),
+                output,
+                captured_disks.as_deref(),
+            );
         }
         set_checkpoint_head(name, &checkpoint_id);
         return Ok(CaptureResult {
@@ -1924,6 +1941,11 @@ fn capture_with_completion(
     if stop_after_capture {
         publish_resume_point(PauseCaptureStage::Durable)?;
         pause.stop(name, vm)?;
+        record_paused_disks(
+            &crate::agent::vm_data_dir(name),
+            output,
+            captured_disks.as_deref(),
+        );
     }
     set_checkpoint_head(name, &checkpoint_id);
     Ok(CaptureResult {
@@ -2780,6 +2802,177 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
     Ok(())
 }
 
+/// Identity of every file in a machine's storage and overlay disk chains, top
+/// to base, one line each: role, format, device, inode, size, modification
+/// and status change times, and path. Any write to a file changes its line.
+/// The status change time of a backing only the service can write, such as a
+/// storage template, is left out: staging hard-links raw backings, which
+/// changes it.
+fn disk_chain_identity(vm_data: &Path) -> Result<String> {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::MetadataExt;
+    let mut identity = String::new();
+    for (role, raw_name) in [
+        ("storage", crate::storage::STORAGE_DISK_FILENAME),
+        ("overlay", crate::storage::OVERLAY_DISK_FILENAME),
+    ] {
+        let (mut source, initial_format) = crate::agent::resolve_disk_image(vm_data, raw_name);
+        if !source.is_file() {
+            continue;
+        }
+        let mut format = match initial_format {
+            crate::data::disk::DiskFormat::Raw => "raw",
+            crate::data::disk::DiskFormat::Qcow2 => "qcow2",
+        };
+        for index in 0..64 {
+            let metadata = std::fs::metadata(&source)
+                .map_err(|error| Error::agent("inspect machine disk", error.to_string()))?;
+            let service_only =
+                metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0;
+            let changed = if index == 0 || !service_only {
+                format!("{}.{}", metadata.ctime(), metadata.ctime_nsec())
+            } else {
+                "-".to_string()
+            };
+            let _ = writeln!(
+                identity,
+                "{role}\t{format}\t{}\t{}\t{}\t{}.{}\t{changed}\t{}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.size(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                source.display()
+            );
+            if format != "qcow2" {
+                break;
+            }
+            let (backing, backing_format) = inspect_qcow2(&source)?;
+            let Some(backing) = backing else {
+                break;
+            };
+            let backing_source = resolve_backing_path(&source, &backing);
+            format = detect_disk_format(&backing_source, backing_format.as_deref())?;
+            source = backing_source;
+        }
+    }
+    Ok(identity)
+}
+
+/// After a pause has stopped the machine, record that its own disk chains are
+/// still exactly what the checkpoint captured, so resume can keep them rather
+/// than install the checkpoint's copies. Nothing is recorded if they changed.
+fn record_paused_disks(vm_data: &Path, artifact: &Path, captured: Option<&str>) {
+    let Some(captured) = captured else {
+        return;
+    };
+    let result = (|| -> Result<()> {
+        if disk_chain_identity(vm_data)? != captured {
+            tracing::info!(vm_data = %vm_data.display(), "disks changed after capture; resume installs the checkpoint's");
+            return Ok(());
+        }
+        let marker = paused_disks_marker(vm_data)?;
+        let partial = marker.with_extension(format!("{}", std::process::id()));
+        let mut file = std::fs::File::create(&partial)?;
+        writeln!(file, "{}", artifact.display())?;
+        file.write_all(captured.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&partial, &marker)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::warn!(vm_data = %vm_data.display(), %error, "could not record paused disks; resume installs the checkpoint's");
+        let _ = remove_paused_disks_marker(vm_data);
+    }
+}
+
+/// Where [`record_paused_disks`] keeps a machine's record: beside its data
+/// directory, which its VMM's uid owns, so that the VMM cannot write it.
+fn paused_disks_marker(vm_data: &Path) -> Result<PathBuf> {
+    match (vm_data.parent(), vm_data.file_name()) {
+        (Some(parent), Some(name)) => {
+            Ok(parent.join(format!(".{}{PAUSED_DISKS_SUFFIX}", name.to_string_lossy())))
+        }
+        _ => Err(Error::agent(
+            "record paused disks",
+            format!("{} has no parent", vm_data.display()),
+        )),
+    }
+}
+
+/// The data directory name a paused-disks record belongs to, or `None` when
+/// `path` is not one.
+pub(crate) fn paused_disks_marker_owner(path: &Path) -> Option<&str> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix('.')?
+        .strip_suffix(PAUSED_DISKS_SUFFIX)
+        .filter(|name| !name.is_empty())
+}
+
+fn remove_paused_disks_marker(vm_data: &Path) -> Result<()> {
+    match std::fs::remove_file(paused_disks_marker(vm_data)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether a paused machine's own disk chains are still the ones `artifact`
+/// captured: recorded when it stopped, unchanged since, and shaped as the
+/// checkpoint's chains are.
+fn paused_disks_intact(vm_data: &Path, artifact: &Path, disks: &[CheckpointDisk]) -> bool {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let Ok(marker) = paused_disks_marker(vm_data) else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(marker)
+    else {
+        return false;
+    };
+    // Only a record this service wrote counts.
+    match file.metadata() {
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o022 == 0 => {}
+        _ => return false,
+    }
+    let mut recorded = String::new();
+    if file.read_to_string(&mut recorded).is_err() {
+        return false;
+    }
+    let Some((recorded_artifact, recorded)) = recorded.split_once('\n') else {
+        return false;
+    };
+    if Path::new(recorded_artifact) != artifact {
+        return false;
+    }
+    match disk_chain_identity(vm_data) {
+        Ok(current) if current == recorded => {}
+        _ => return false,
+    }
+    let shape: Vec<(&str, &str)> = recorded
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            Some((fields.next()?, fields.next()?))
+        })
+        .collect();
+    let expected: Vec<(&str, &str)> = disks
+        .iter()
+        .flat_map(|disk| {
+            disk.files
+                .iter()
+                .map(|file| (disk.role.as_str(), file.format.as_str()))
+        })
+        .collect();
+    shape == expected
+}
+
 /// Stage exact, self-contained disk chains without flattening them.
 ///
 /// Each qcow2 layer is copied as-is and rebased to a reserved relative
@@ -2789,6 +2982,17 @@ fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
 pub fn stage_disk_chains(
     snapshot_dir: &Path,
     checkpoint_dir: &Path,
+) -> Result<Vec<CheckpointDisk>> {
+    stage_disk_chains_with(snapshot_dir, checkpoint_dir, false)
+}
+
+/// [`stage_disk_chains`]; with `share_backings`, qcow2 backing layers are
+/// linked from [`stage_shared_backing`]'s copies. Only for a staging tree that
+/// is packed and then discarded: nothing may modify a staged file in place.
+fn stage_disk_chains_with(
+    snapshot_dir: &Path,
+    checkpoint_dir: &Path,
+    share_backings: bool,
 ) -> Result<Vec<CheckpointDisk>> {
     let mut disks = Vec::new();
     for (role, raw_name) in [
@@ -2811,7 +3015,6 @@ pub fn stage_disk_chains(
             let target = disk_target(role, index, format)?;
             let artifact_path = format!("checkpoint/disks/{role}/{index}");
             let staged = disk_staging.join(index.to_string());
-            stage_checkpoint_disk_layer(&source, &staged, index, format)?;
 
             let next = if format == "qcow2" {
                 let (backing, backing_format) = inspect_qcow2(&source)?;
@@ -2827,14 +3030,24 @@ pub fn stage_disk_chains(
                         let next_format =
                             detect_disk_format(&backing_source, backing_format.as_deref())?;
                         let next_target = disk_target(role, index + 1, next_format)?;
-                        rewrite_qcow2_backing(&staged, &next_target)?;
-                        Some((backing_source, next_format))
+                        Some((backing_source, next_format, next_target))
                     }
                     None => None,
                 }
             } else {
                 None
             };
+            let next_target = next.as_ref().map(|(_, _, target)| target.as_str());
+            if !(share_backings
+                && index > 0
+                && format == "qcow2"
+                && stage_shared_backing(&source, &staged, next_target)?)
+            {
+                stage_checkpoint_disk_layer(&source, &staged, index, format)?;
+                if let Some(next_target) = next_target {
+                    rewrite_qcow2_backing(&staged, next_target)?;
+                }
+            }
 
             let metadata = std::fs::metadata(&staged)
                 .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
@@ -2851,7 +3064,7 @@ pub fn stage_disk_chains(
                 format: format.to_string(),
             });
             match next {
-                Some((next_source, next_format)) => {
+                Some((next_source, next_format, _)) => {
                     source = next_source;
                     format = next_format;
                 }
@@ -2876,6 +3089,119 @@ pub fn stage_disk_chains(
         ));
     }
     Ok(disks)
+}
+
+/// Stage the qcow2 backing layer `source` with its backing name rewritten to
+/// `next_target`, sharing one copy between checkpoints. Backing layers are
+/// immutable, and every fork clone of a source shares them: without this,
+/// each clone's pause copies them anew.
+///
+/// The first pause stages a private copy as before and keeps it by a second
+/// hard link; later ones link that. A copy is named by a digest of the boot,
+/// of the layer's device, inode, size and change times, and of `next_target`:
+/// a layer that changes gets a new copy, and a copy is never used after a
+/// crash may have lost it, so none is synced. Idle copies beyond the newest
+/// few are removed. `Ok(false)` means there is no cache here; the caller
+/// stages a private copy as before.
+fn stage_shared_backing(source: &Path, staged: &Path, next_target: Option<&str>) -> Result<bool> {
+    let Some(cache) = dirs::cache_dir() else {
+        return Ok(false);
+    };
+    stage_shared_backing_in(
+        &cache.join("smolvm").join("checkpoint-backings"),
+        source,
+        staged,
+        next_target,
+    )
+}
+
+fn stage_shared_backing_in(
+    cache: &Path,
+    source: &Path,
+    staged: &Path,
+    next_target: Option<&str>,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    const KEEP: usize = 4;
+    static LINKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let identity = |metadata: &std::fs::Metadata| {
+        [
+            metadata.dev(),
+            metadata.ino(),
+            metadata.size(),
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+        ]
+    };
+    let Ok(boot) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+        return Ok(false);
+    };
+    if std::fs::create_dir_all(cache).is_err() {
+        return Ok(false);
+    }
+    let before = std::fs::metadata(source)
+        .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
+    let mut hash = Sha256::new();
+    hash.update(b"checkpoint-backing-v1\0");
+    hash.update(boot.trim().as_bytes());
+    for value in identity(&before) {
+        hash.update(value.to_le_bytes());
+    }
+    hash.update(next_target.unwrap_or_default().as_bytes());
+    let key = hex::encode(hash.finalize());
+    let cached = cache.join(format!("{key}.qcow2"));
+    if std::fs::hard_link(&cached, staged).is_ok() {
+        return Ok(true);
+    }
+    // Clones pausing together all miss at once: one stages, the rest link.
+    let lock_path = cache.join(format!("{key}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .and_then(|lock| crate::agent::fork::lock_file_exclusive(&lock).map(|()| lock));
+    if lock.is_ok() && std::fs::hard_link(&cached, staged).is_ok() {
+        return Ok(true);
+    }
+    crate::disk_utils::clone_or_copy_file(source, staged)?;
+    if let Some(next_target) = next_target {
+        rewrite_qcow2_backing(staged, next_target)?;
+    }
+    let unchanged =
+        std::fs::metadata(source).is_ok_and(|after| identity(&after) == identity(&before));
+    if lock.is_ok() && unchanged {
+        let temporary = cache.join(format!(
+            ".{key}.{}.{}",
+            std::process::id(),
+            LINKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if std::fs::hard_link(staged, &temporary).is_err()
+            || std::fs::rename(&temporary, &cached).is_err()
+        {
+            let _ = std::fs::remove_file(&temporary);
+        }
+    }
+    let _ = std::fs::remove_file(&lock_path);
+    drop(lock);
+    // Keep copies still linked into some staging tree, and the newest idle ones.
+    if let Ok(entries) = std::fs::read_dir(cache) {
+        let mut idle: Vec<(std::time::SystemTime, PathBuf)> = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".qcow2"))
+            .filter_map(|entry| {
+                let metadata = entry.metadata().ok()?;
+                (metadata.nlink() == 1).then_some((metadata.modified().ok()?, entry.path()))
+            })
+            .collect();
+        idle.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        for (_, path) in idle.into_iter().skip(KEEP) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(true)
 }
 
 fn stage_checkpoint_disk_layer(
@@ -3518,6 +3844,17 @@ pub fn install(
     vm_data_dir: &Path,
     checkpoint: &PortableCheckpointManifest,
 ) -> Result<()> {
+    install_with(extracted, vm_data_dir, checkpoint, false)
+}
+
+/// [`install`]; with `keep_disks`, the machine keeps the disk chains it has,
+/// which must be the ones the checkpoint captured, and none are extracted.
+fn install_with(
+    extracted: &Path,
+    vm_data_dir: &Path,
+    checkpoint: &PortableCheckpointManifest,
+    keep_disks: bool,
+) -> Result<()> {
     validate_compatibility(checkpoint)?;
     validate_disk_manifest(&checkpoint.disks)?;
     #[cfg(target_os = "linux")]
@@ -3575,80 +3912,82 @@ pub fn install(
             install_credential_ca(extracted, vm_data_dir, &partial, asset)?;
         }
 
-        let staged_disks = partial.join("disks");
-        std::fs::create_dir(&staged_disks)
-            .map_err(|error| Error::agent("stage checkpoint disks", error.to_string()))?;
         // Names to move into the machine directory, and the copy-on-write tops
         // to create over a captured writable disk once its base is in place.
         let mut staged_names: Vec<String> = Vec::new();
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut cow_tops: Vec<crate::agent::DiskOverlaySpec> = Vec::new();
-        for disk in &checkpoint.disks {
-            for (index, file) in disk.files.iter().enumerate() {
-                let started = std::time::Instant::now();
-                let staged = staged_disks.join(&file.target);
-                let source = extracted.join(&file.asset.path);
-                #[cfg(target_os = "linux")]
-                if index == 0
-                    && disk.files.len() == 1
-                    && file.format == "raw"
-                    && cow_restore_enabled()
-                {
-                    // Copying the captured disk is most of a restore. Share it
-                    // as an immutable base instead, like a deeper layer, and
-                    // give this machine a thin qcow2 top of its own. Only a
-                    // base that really is shared earns the extra layer; a
-                    // private copy is simply this machine's writable disk.
-                    let base_name = format!(".smolcheckpoint-{}-base.raw", disk.role);
-                    let staged_base = staged_disks.join(&base_name);
-                    promote_retained_backing(extracted, &source, &file.asset)?;
-                    link_or_copy_verified_sparse(&source, &staged_base, &file.asset)?;
-                    if same_inode(&source, &staged_base)? {
-                        cow_tops.push((
-                            vm_data_dir.join(Path::new(&file.target).with_extension("qcow2")),
-                            vm_data_dir.join(&base_name),
-                            crate::data::disk::DiskFormat::Raw,
-                        ));
-                        staged_names.push(base_name);
-                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "cow_top", "checkpoint disk installed");
-                    } else {
-                        std::fs::rename(&staged_base, &staged).map_err(|error| {
-                            Error::agent("stage checkpoint disk", error.to_string())
-                        })?;
-                        staged_names.push(file.target.clone());
-                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = true, "checkpoint disk installed");
-                    }
-                    continue;
-                }
-                staged_names.push(file.target.clone());
-                if index == 0 {
-                    // The active top layer is writable after resume and must
-                    // never alias the immutable extraction cache.
-                    copy_verified_sparse(&source, &staged, &file.asset)?;
-                } else {
-                    // Backings remain immutable. Linking them avoids scanning
-                    // tens of GiB of sparse holes during every import.
+        if !keep_disks {
+            let staged_disks = partial.join("disks");
+            std::fs::create_dir(&staged_disks)
+                .map_err(|error| Error::agent("stage checkpoint disks", error.to_string()))?;
+            for disk in &checkpoint.disks {
+                for (index, file) in disk.files.iter().enumerate() {
+                    let started = std::time::Instant::now();
+                    let staged = staged_disks.join(&file.target);
+                    let source = extracted.join(&file.asset.path);
                     #[cfg(target_os = "linux")]
-                    if file.format == "raw" {
+                    if index == 0
+                        && disk.files.len() == 1
+                        && file.format == "raw"
+                        && cow_restore_enabled()
+                    {
+                        // Copying the captured disk is most of a restore. Share it
+                        // as an immutable base instead, like a deeper layer, and
+                        // give this machine a thin qcow2 top of its own. Only a
+                        // base that really is shared earns the extra layer; a
+                        // private copy is simply this machine's writable disk.
+                        let base_name = format!(".smolcheckpoint-{}-base.raw", disk.role);
+                        let staged_base = staged_disks.join(&base_name);
                         promote_retained_backing(extracted, &source, &file.asset)?;
+                        link_or_copy_verified_sparse(&source, &staged_base, &file.asset)?;
+                        if same_inode(&source, &staged_base)? {
+                            cow_tops.push((
+                                vm_data_dir.join(Path::new(&file.target).with_extension("qcow2")),
+                                vm_data_dir.join(&base_name),
+                                crate::data::disk::DiskFormat::Raw,
+                            ));
+                            staged_names.push(base_name);
+                            tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "cow_top", "checkpoint disk installed");
+                        } else {
+                            std::fs::rename(&staged_base, &staged).map_err(|error| {
+                                Error::agent("stage checkpoint disk", error.to_string())
+                            })?;
+                            staged_names.push(file.target.clone());
+                            tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = true, "checkpoint disk installed");
+                        }
+                        continue;
                     }
-                    link_or_copy_verified_sparse(&source, &staged, &file.asset)?;
-                }
-                if file.format == "qcow2" {
-                    let (backing, _) = inspect_qcow2(&staged)?;
-                    let expected_backing =
-                        disk.files.get(index + 1).map(|next| next.target.as_str());
-                    if backing.as_deref() != expected_backing {
-                        return Err(Error::agent(
-                            "install checkpoint",
-                            format!(
-                                "qcow2 '{}' references {:?}, expected {:?}",
-                                file.target, backing, expected_backing
-                            ),
-                        ));
+                    staged_names.push(file.target.clone());
+                    if index == 0 {
+                        // The active top layer is writable after resume and must
+                        // never alias the immutable extraction cache.
+                        copy_verified_sparse(&source, &staged, &file.asset)?;
+                    } else {
+                        // Backings remain immutable. Linking them avoids scanning
+                        // tens of GiB of sparse holes during every import.
+                        #[cfg(target_os = "linux")]
+                        if file.format == "raw" {
+                            promote_retained_backing(extracted, &source, &file.asset)?;
+                        }
+                        link_or_copy_verified_sparse(&source, &staged, &file.asset)?;
                     }
+                    if file.format == "qcow2" {
+                        let (backing, _) = inspect_qcow2(&staged)?;
+                        let expected_backing =
+                            disk.files.get(index + 1).map(|next| next.target.as_str());
+                        if backing.as_deref() != expected_backing {
+                            return Err(Error::agent(
+                                "install checkpoint",
+                                format!(
+                                    "qcow2 '{}' references {:?}, expected {:?}",
+                                    file.target, backing, expected_backing
+                                ),
+                            ));
+                        }
+                    }
+                    tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = index == 0, "checkpoint disk installed");
                 }
-                tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = index == 0, "checkpoint disk installed");
             }
         }
         std::fs::write(partial.join(PENDING_MARKER), b"1\n")
@@ -3656,6 +3995,11 @@ pub fn install(
         std::fs::rename(&partial, &destination)
             .map_err(|error| Error::agent("publish checkpoint", error.to_string()))?;
 
+        // The machine's disks now belong to this resume, kept or replaced.
+        remove_paused_disks_marker(vm_data_dir)?;
+        if keep_disks {
+            return Ok(());
+        }
         // Publish the exact captured block chains into the paths the launcher
         // attaches. Creation is still private/uncommitted at this point, so a
         // failure causes the entire machine reservation to be rolled back.
@@ -3753,6 +4097,9 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .ok_or_else(|| Error::agent("resume machine", "artifact has no execution state"))?;
     validate_compatibility(checkpoint)?;
     let vm_data = crate::agent::vm_data_dir(&record.name);
+    // A pause leaves the machine's own disks exactly as captured unless
+    // something wrote to them since; then they need not be installed again.
+    let keep_disks = paused_disks_intact(&vm_data, artifact, &checkpoint.disks);
     // Resuming here uses this host's runtime, so the libraries, agent rootfs
     // and storage template the artifact carries for other hosts stay packed.
     let mut skip: Vec<PathBuf> = manifest
@@ -3766,6 +4113,9 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
     if let Some(template) = &manifest.assets.storage_template {
         skip.push(PathBuf::from(&template.path));
     }
+    if keep_disks {
+        skip.push(PathBuf::from("checkpoint/disks"));
+    }
     let extract_and_install = |parent: &Path| -> Result<()> {
         let staged = tempfile::Builder::new()
             .prefix("resume-")
@@ -3773,7 +4123,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         smolvm_pack::extract::extract_checkpoint_sidecar(artifact, staged.path(), &footer, &skip)
             .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
         clear_stale_restore_state(&vm_data)?;
-        install(staged.path(), &vm_data, checkpoint)
+        install_with(staged.path(), &vm_data, checkpoint, keep_disks)
     };
     // Stage on tmpfs when there is room, so the RAM image handed to the VMM
     // is never written to disk. Its RAM is freed once the VMM has read it.
@@ -4880,6 +5230,89 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&source).unwrap().ino(),
             std::fs::metadata(&raw_staged).unwrap().ino()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_backing_is_copied_once_per_layer_version() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let source = dir.path().join("layer.qcow2");
+        let live = qcow2_header_fixture();
+        std::fs::write(&source, &live).unwrap();
+        let next = disk_target("storage", 10, "qcow2").unwrap();
+        let [first, second, third] = ["a", "b", "c"].map(|name| dir.path().join(name));
+
+        assert!(stage_shared_backing_in(&cache, &source, &first, Some(&next)).unwrap());
+        assert!(stage_shared_backing_in(&cache, &source, &second, Some(&next)).unwrap());
+        let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+        assert_eq!(inode(&first), inode(&second), "the copy was not shared");
+        assert_ne!(inode(&first), inode(&source));
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            live,
+            "the live layer changed"
+        );
+        let staged = std::fs::read(&first).unwrap();
+        let len = u32::from_be_bytes(staged[16..20].try_into().unwrap()) as usize;
+        assert_eq!(&staged[128..128 + len], next.as_bytes());
+
+        // A changed layer, or another backing name, needs its own copy.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&source, &live).unwrap();
+        assert!(stage_shared_backing_in(&cache, &source, &third, Some(&next)).unwrap());
+        assert_ne!(inode(&third), inode(&first));
+        let other = dir.path().join("d");
+        assert!(stage_shared_backing_in(&cache, &source, &other, Some("x")).unwrap());
+        assert_ne!(inode(&other), inode(&third));
+    }
+
+    #[test]
+    fn paused_disks_are_kept_only_while_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = &dir.path().join("0123abcd");
+        std::fs::create_dir(vm).unwrap();
+        std::fs::write(vm.join(crate::storage::STORAGE_DISK_FILENAME), b"storage").unwrap();
+        std::fs::write(vm.join(crate::storage::OVERLAY_DISK_FILENAME), b"overlay").unwrap();
+        let artifact = vm.join("pause-1.smolcheckpoint");
+        let disk = |role: &str| CheckpointDisk {
+            role: role.to_string(),
+            files: vec![CheckpointDiskFile {
+                asset: CheckpointAsset {
+                    path: format!("checkpoint/disks/{role}/0"),
+                    size: 7,
+                    sha256: String::new(),
+                },
+                target: format!("{role}.raw"),
+                format: "raw".to_string(),
+            }],
+        };
+        let disks = [disk("storage"), disk("overlay")];
+
+        let captured = disk_chain_identity(vm).unwrap();
+        record_paused_disks(vm, &artifact, Some(&captured));
+        assert!(paused_disks_intact(vm, &artifact, &disks));
+        assert!(!paused_disks_intact(
+            vm,
+            &vm.join("other.smolcheckpoint"),
+            &disks
+        ));
+        assert!(!paused_disks_intact(vm, &artifact, &disks[..1]));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(vm.join(crate::storage::STORAGE_DISK_FILENAME), b"written").unwrap();
+        assert!(!paused_disks_intact(vm, &artifact, &disks));
+
+        // Disks that changed between capture and stop are never recorded.
+        remove_paused_disks_marker(vm).unwrap();
+        record_paused_disks(vm, &artifact, Some(&captured));
+        assert!(!paused_disks_marker(vm).unwrap().exists());
+        assert_eq!(
+            paused_disks_marker_owner(&paused_disks_marker(vm).unwrap()),
+            Some("0123abcd")
         );
     }
 
