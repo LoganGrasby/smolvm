@@ -403,6 +403,10 @@ fn main() {
         "smolvm-agent started, deferred boot work in progress"
     );
 
+    // Before the first container: every later crun call skips re-cloning itself.
+    #[cfg(target_os = "linux")]
+    crun::protect_binary();
+
     let t0 = uptime_ms();
     match network::configure_from_env() {
         Ok(true) => {
