@@ -1913,6 +1913,18 @@ pub fn setup_private_idmap_mounts(
     result
 }
 
+/// Mount only the shared pack for a VMM that does not use an image seed.
+/// Kept as the public pack-only entry point for existing callers.
+#[cfg(target_os = "linux")]
+pub fn setup_pack_idmap_mount(
+    shared: &std::path::Path,
+    target: &std::path::Path,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<()> {
+    setup_private_idmap_mounts(Some((shared, target)), None, uid, gid)
+}
+
 #[cfg(target_os = "linux")]
 fn mount_idmapped(
     shared: &std::path::Path,
