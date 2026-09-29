@@ -52,6 +52,7 @@ pub fn seed_storage(
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Seeds only exist on Linux, so other platforms have nothing to revalidate.
 pub fn revalidate_seed(_: &str, _: &str, _: &crate::registry::PullAuth) -> crate::Result<bool> {
     Ok(false)
 }
