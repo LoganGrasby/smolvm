@@ -3118,6 +3118,13 @@ pub async fn start_machine(
     // A fresh registry-image machine starts on a shared seed of its image (see
     // `image_seed`), authorized with the caller's registry credentials.
     let seed_image = crate::image_seed::wants_seed(&name, &record, restoring_checkpoint);
+    let preseeded_image = (!record.init_completed
+        && !restoring_checkpoint
+        && record.source_smolmachine.is_none()
+        && record.vm_uid_owner().is_none()
+        && record.golden.is_none())
+    .then(|| record.image.clone())
+    .flatten();
     let seed_auth = match &registry_auth {
         Some(auth) => crate::registry::PullAuth::Basic {
             username: auth.username.clone(),
@@ -3126,6 +3133,18 @@ pub async fn start_machine(
         None => crate::registry::PullAuth::FromConfig,
     };
     let (manager, pid) = tokio::task::spawn_blocking(move || {
+        let mut seed_image = seed_image;
+        if let Some(image) = preseeded_image {
+            match crate::image_seed::revalidate_seed(&name_clone, &image, &seed_auth) {
+                Ok(true) => {}
+                Ok(false) => {
+                    seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                }
+                Err(error) => {
+                    tracing::warn!(machine = %name_clone, %error, "pre-created image seed rejected; pulling in the guest");
+                }
+            }
+        }
         if let Some(image) = seed_image {
             let seeded = std::env::current_exe()
                 .map_err(|e| crate::Error::config("image seed", e.to_string()))

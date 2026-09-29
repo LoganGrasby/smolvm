@@ -57,6 +57,29 @@ pub async fn authorized_reference_digest(reference: &str, auth: &PullAuth) -> Re
         .map_err(|e| Error::agent("image-auth", e.to_string()))
 }
 
+/// The config and ordered layers of the platform image the caller can pull.
+/// This identifies the bytes the guest actually stores even when a tag moves
+/// during a seed build or a registry mirror serves different content.
+pub async fn authorized_image_content(
+    reference: &str,
+    auth: &PullAuth,
+) -> Result<(String, Vec<String>)> {
+    let (_, _, bytes) = resolve_manifest(reference, auth, None).await?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::agent("image-auth", e.to_string()))?;
+    let config = manifest["config"]["digest"]
+        .as_str()
+        .ok_or_else(|| Error::agent("image-auth", "manifest lacks config digest"))?;
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or_else(|| Error::agent("image-auth", "manifest lacks layers"))?
+        .iter()
+        .map(|layer| layer["digest"].as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| Error::agent("image-auth", "manifest layer lacks digest"))?;
+    Ok((config.to_string(), layers))
+}
+
 /// The image's default command, resolved without pulling its layers.
 ///
 /// The `--oci-cache` run path needs the image's declared ENTRYPOINT/CMD to run
@@ -271,6 +294,16 @@ mod tests {
                 digest,
                 format!("sha256:{}", hex::encode(Sha256::digest(&body))),
                 "the digest is the content address of the manifest"
+            );
+            let content = authorized_image_content(
+                &reference,
+                &PullAuth::Bearer("good-token".into()),
+            )
+            .await
+            .expect("authorized caller should resolve image content");
+            assert_eq!(
+                content,
+                (format!("sha256:{}", "0".repeat(64)), Vec::new())
             );
         });
     }

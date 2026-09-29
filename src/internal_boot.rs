@@ -232,35 +232,44 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         );
     }
 
-    // Shared pack store: present the node's root-owned shared pack copy at this
-    // VM's `packed_layers_dir` via a per-VM idmapped bind mount (on-disk uid 0 ->
-    // this VM's uid), in a private mount namespace that's torn down on exit. Done
-    // here while still privileged (needs CAP_SYS_ADMIN) and BEFORE the uid drop
-    // and Landlock/seccomp. The manager only sets `pack_idmap_source` when the uid
-    // drop is active, so SMOLVM_VM_UID is guaranteed present; fail closed if not.
+    // Present private backing stores through idmapped mounts in this VMM's own
+    // mount namespace before dropping its uid. A seed stays root-only on the
+    // host; only the VMM using its overlay sees the mapped, read-only copy.
     #[cfg(target_os = "linux")]
-    if let Some(ref shared) = config.pack_idmap_source {
-        let target = match config.packed_layers_dir {
-            Some(ref t) => t,
-            None => {
+    {
+        // The seed belongs to the launcher uid. A mount is needed only when
+        // this VMM will drop to a different, per-VM uid.
+        let seed_dir = std::env::var_os("SMOLVM_VM_UID")
+            .and_then(|_| seed_dir_for_disk(&config.storage_disk_path));
+        let pack = config.pack_idmap_source.as_ref().map(|shared| {
+            let target = config.packed_layers_dir.as_ref().unwrap_or_else(|| {
                 eprintln!("[pack-idmap] idmap source set without a mountpoint; refusing to boot");
                 crate::process::exit_child(1);
-            }
-        };
-        let uid: u32 = std::env::var("SMOLVM_VM_UID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                eprintln!("[pack-idmap] idmap source set without SMOLVM_VM_UID; refusing to boot");
-                crate::process::exit_child(1);
             });
-        let gid: u32 = std::env::var("SMOLVM_VM_GID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(uid);
-        if let Err(e) = crate::process::setup_pack_idmap_mount(shared, target, uid, gid) {
-            eprintln!("[pack-idmap] failed to mount shared pack, refusing to boot: {e}");
-            crate::process::exit_child(1);
+            (shared.as_path(), target.as_path())
+        });
+        if pack.is_none() && seed_dir.is_none() {
+            // No private mount needed for this boot.
+        } else {
+            let uid: u32 = std::env::var("SMOLVM_VM_UID")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "[pack-idmap] idmap source set without SMOLVM_VM_UID; refusing to boot"
+                    );
+                    crate::process::exit_child(1);
+                });
+            let gid: u32 = std::env::var("SMOLVM_VM_GID")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(uid);
+            if let Err(e) =
+                crate::process::setup_private_idmap_mounts(pack, seed_dir.as_deref(), uid, gid)
+            {
+                eprintln!("[idmap] failed to mount private backing store, refusing to boot: {e}");
+                crate::process::exit_child(1);
+            }
         }
     }
 
@@ -746,6 +755,26 @@ fn boot_disk_backing_paths(
         .chain(extra_disks.iter().map(|(path, _, _)| path.as_path()))
         .flat_map(qcow2_backing_chain)
         .collect()
+}
+
+/// Find a seed in the storage backing chain, including a fork's intermediate
+/// overlays. Only an exact cache path with a hex key is eligible for a mount.
+#[cfg(target_os = "linux")]
+fn seed_dir_for_disk(path: &Path) -> Option<PathBuf> {
+    let root = crate::image_seed::seed_root().canonicalize().ok()?;
+    qcow2_backing_chain(path).into_iter().find_map(|backing| {
+        let backing = backing.canonicalize().ok()?;
+        let key_dir = backing.parent()?;
+        let key = key_dir.file_name()?.to_str()?;
+        if backing.file_name()? != "storage.qcow2"
+            || key.len() != 64
+            || !key.bytes().all(|c| c.is_ascii_hexdigit())
+            || key_dir.parent()? != root
+        {
+            return None;
+        }
+        Some(key_dir.to_path_buf())
+    })
 }
 
 /// Resolve a bounded qcow2 backing chain; raw and backing-less files add nothing.

@@ -1858,12 +1858,10 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
     finish(Ok(nsfd))
 }
 
-/// Present the root-owned shared pack at `shared` onto the per-VM mountpoint
-/// `target` via an idmapped bind mount that maps on-disk uid/gid 0 -> `(uid, gid)`
-/// — so the VMM (about to drop to that uid) reads every file as its owner, while
-/// the underlying shared copy stays root-only on disk (a sibling VM's uid can't
-/// read it directly). This is what lets one root-owned shared copy replace the
-/// per-machine extract + chown while preserving the per-VM uid isolation (#456).
+/// Present root-owned backing stores to one VMM with idmapped bind mounts.
+/// The pack gets its writable per-VM mountpoint; a seed directory is mounted
+/// over itself read-only. On-disk uid/gid 0 maps to the VMM's `(uid, gid)`,
+/// while other host users and sibling VMMs cannot traverse the seed directory.
 ///
 /// The mount is made in a fresh **private** mount namespace, so it is visible only
 /// to this VMM process (and the libkrun threads it later spawns) and is torn down
@@ -1871,13 +1869,12 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
 /// the host or sibling VMs. MUST run while still privileged (CAP_SYS_ADMIN) and
 /// BEFORE Landlock/seccomp/`drop_privileges`. Linux ≥ 5.12.
 #[cfg(target_os = "linux")]
-pub fn setup_pack_idmap_mount(
-    shared: &std::path::Path,
-    target: &std::path::Path,
+pub fn setup_private_idmap_mounts(
+    pack: Option<(&std::path::Path, &std::path::Path)>,
+    seed_dir: Option<&std::path::Path>,
     uid: u32,
     gid: u32,
 ) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
     let errno = || std::io::Error::last_os_error();
 
     // Our own mount namespace: the idmap mount lives and dies with this process.
@@ -1903,6 +1900,28 @@ pub fn setup_pack_idmap_mount(
         libc::close(userns_fd);
     };
 
+    let result = (|| {
+        if let Some((shared, target)) = pack {
+            mount_idmapped(shared, target, userns_fd, false)?;
+        }
+        if let Some(seed_dir) = seed_dir {
+            mount_idmapped(seed_dir, seed_dir, userns_fd, true)?;
+        }
+        Ok(())
+    })();
+    close_userns();
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn mount_idmapped(
+    shared: &std::path::Path,
+    target: &std::path::Path,
+    userns_fd: libc::c_int,
+    read_only: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let errno = || std::io::Error::last_os_error();
     let shared_c = std::ffi::CString::new(shared.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let target_c = std::ffi::CString::new(target.as_os_str().as_bytes())
@@ -1923,9 +1942,7 @@ pub fn setup_pack_idmap_mount(
         )
     } as libc::c_int;
     if tree < 0 {
-        let e = errno();
-        close_userns();
-        return Err(e);
+        return Err(errno());
     }
     let close_tree = || unsafe {
         libc::close(tree);
@@ -1933,7 +1950,12 @@ pub fn setup_pack_idmap_mount(
 
     // Attach the idmap (recursively) to the cloned tree.
     let mut attr: libc::mount_attr = unsafe { std::mem::zeroed() };
-    attr.attr_set = libc::MOUNT_ATTR_IDMAP;
+    attr.attr_set = libc::MOUNT_ATTR_IDMAP
+        | if read_only {
+            libc::MOUNT_ATTR_RDONLY
+        } else {
+            0
+        };
     attr.userns_fd = userns_fd as u64;
     let rc = unsafe {
         libc::syscall(
@@ -1948,7 +1970,6 @@ pub fn setup_pack_idmap_mount(
     if rc != 0 {
         let e = errno();
         close_tree();
-        close_userns();
         return Err(e);
     }
 
@@ -1966,7 +1987,6 @@ pub fn setup_pack_idmap_mount(
     let result = if rc != 0 { Err(errno()) } else { Ok(()) };
     // The kernel holds its own references now; our fds are no longer needed.
     close_tree();
-    close_userns();
     result
 }
 

@@ -22,7 +22,9 @@
 //! `SMOLVM_IMAGE_SEEDS=0` turns it off.
 
 #[cfg(target_os = "linux")]
-pub use linux::{seed_root, seed_storage, seedable_image, wants_seed, SEED_MACHINE_PREFIX};
+pub use linux::{
+    revalidate_seed, seed_root, seed_storage, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+};
 
 /// Seeds need the Linux storage-template overlay; elsewhere nothing seeds.
 #[cfg(not(target_os = "linux"))]
@@ -49,6 +51,11 @@ pub fn seed_storage(
     Ok(false)
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn revalidate_seed(_: &str, _: &str, _: &crate::registry::PullAuth) -> crate::Result<bool> {
+    Ok(false)
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::os::fd::AsRawFd;
@@ -64,7 +71,7 @@ mod linux {
 
     /// Bumped when the guest's storage layout changes in a way an old seed would not
     /// satisfy.
-    const SEED_FORMAT: &str = "image-seed-v1";
+    const SEED_FORMAT: &str = "image-seed-v2";
 
     /// Name prefix of the throwaway machines that build seeds.
     pub const SEED_MACHINE_PREFIX: &str = "image-seed-";
@@ -147,16 +154,24 @@ mod linux {
         let key = seed_key(image, &digest, &template)?;
         let root = seed_root();
         std::fs::create_dir_all(&root).map_err(|e| Error::config("image seed", e.to_string()))?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o711))
+            .map_err(|e| Error::config("image seed", e.to_string()))?;
         let seed = root.join(&key).join("storage.qcow2");
-
+        let mut built = false;
+        // A cache hit holds the shared lock through overlay publication. Prune
+        // takes the exclusive lock before scanning backing references, so it
+        // cannot miss an overlay being created and then delete its base.
+        let mut cache = CacheLock::shared(&root)?;
         if !seed.exists() {
-            // One builder per image; concurrent first starts wait for it and then
-            // share its result instead of each pulling.
-            let _lock = Lock::exclusive(&root.join(format!("{key}.lock")))?;
+            drop(cache);
+            // One builder per image; concurrent first starts wait for it and
+            // then share it. This lock file is permanent: unlinking a locked
+            // file would let new callers lock a different inode for this key.
+            let _build = Lock::exclusive(&root.join(format!("{key}.lock")))?;
             if !seed.exists() {
-                build_seed(exe, image, &key, &seed, proxy, no_proxy)?;
-                // The builder pulled the tag, not the digest. If the tag moved in
-                // the meantime, what it pulled belongs under another key.
+                build_seed(exe, image, auth, &key, &seed, proxy, no_proxy)?;
+                // The builder pulled the tag, not the digest. If the tag moved
+                // in the meantime, discard the seed rather than miskey it.
                 if resolve()? != digest {
                     let _ = std::fs::remove_dir_all(seed.parent().expect("seed path has a parent"));
                     return Err(Error::config(
@@ -164,20 +179,103 @@ mod linux {
                         format!("{image} moved during the seed build"),
                     ));
                 }
-                prune(&root, max_bytes(), &seed);
+                built = true;
             }
+            cache = CacheLock::shared(&root)?;
         }
-        // Recently used seeds are the last to be evicted.
-        let _ =
-            std::fs::File::open(&seed).and_then(|f| f.set_modified(std::time::SystemTime::now()));
-
+        if !seed.exists() {
+            return Err(Error::config(
+                "image seed",
+                "seed disappeared before overlay creation",
+            ));
+        }
         let dir = crate::agent::ensure_vm_dir(name)
             .map_err(|e| Error::config("image seed", e.to_string()))?;
         let storage = dir
             .join(crate::storage::STORAGE_DISK_FILENAME)
             .with_extension(DiskFormat::Qcow2.extension());
-        crate::agent::create_disk_overlays(&[(storage, seed, DiskFormat::Qcow2)])?;
+        // Build under a unique name and publish with a no-replace hard link.
+        // A failed libkrun call cannot leave a partial final disk, and a
+        // concurrent start cannot have its finished disk removed or replaced.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let staging = dir.join(format!(
+            ".seed-overlay-{}-{nonce}.qcow2",
+            std::process::id()
+        ));
+        let created = crate::agent::create_disk_overlays(&[(
+            staging.clone(),
+            seed.clone(),
+            DiskFormat::Qcow2,
+        )]);
+        if let Err(error) = created {
+            let _ = std::fs::remove_file(staging);
+            return Err(error);
+        }
+        let published = std::fs::hard_link(&staging, &storage)
+            .map_err(|e| Error::config("image seed", e.to_string()));
+        let _ = std::fs::remove_file(staging);
+        published?;
+        // Recently used seeds are the last to be evicted.
+        let _ =
+            std::fs::File::open(&seed).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        drop(cache);
+        if built {
+            prune(&root, max_bytes(), &seed);
+        }
         Ok(true)
+    }
+
+    /// Reauthorize a seed attached at API create with the credentials supplied
+    /// at start. A moved tag or denied request discards the untouched overlay;
+    /// the start path can then seed again or let the guest pull normally.
+    pub fn revalidate_seed(name: &str, image: &str, auth: &PullAuth) -> Result<bool> {
+        let storage = crate::agent::vm_data_dir(name)
+            .join(crate::storage::STORAGE_DISK_FILENAME)
+            .with_extension(DiskFormat::Qcow2.extension());
+        let Some(backing) = qcow2_backing(&storage) else {
+            return Ok(false);
+        };
+        let root = seed_root();
+        let Some(key_dir) = backing.parent() else {
+            return Ok(false);
+        };
+        if key_dir.parent() != Some(root.as_path())
+            || backing.file_name().is_none_or(|n| n != "storage.qcow2")
+        {
+            return Ok(false);
+        }
+        let expected = (|| -> Result<PathBuf> {
+            let template = storage_template()
+                .ok_or_else(|| Error::config("image seed", "storage template unavailable"))?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| Error::config("image seed", e.to_string()))?;
+            let digest =
+                rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?;
+            Ok(root
+                .join(seed_key(image, &digest, &template)?)
+                .join("storage.qcow2"))
+        })();
+        match expected {
+            Ok(expected)
+                if expected.canonicalize().ok() == backing.canonicalize().ok()
+                    && backing.is_file() =>
+            {
+                Ok(true)
+            }
+            result => {
+                // Only a fresh machine's storage overlay is passed here. Do not
+                // leave unauthorized or stale image contents for the guest.
+                std::fs::remove_file(&storage)
+                    .map_err(|e| Error::config("image seed", e.to_string()))?;
+                result?;
+                Ok(false)
+            }
+        }
     }
 
     /// Pull `image` once in a throwaway machine that never runs a workload, and
@@ -185,6 +283,7 @@ mod linux {
     fn build_seed(
         exe: &Path,
         image: &str,
+        auth: &PullAuth,
         key: &str,
         seed: &Path,
         proxy: Option<&str>,
@@ -210,6 +309,26 @@ mod linux {
                 start.extend(["--no-proxy", no_proxy]);
             }
             run(exe, &start)?;
+            // Compare the guest's stored config and layer digests to the
+            // caller-authorized platform manifest. A second HEAD alone misses
+            // tag ABA and a registry mirror serving different image bytes.
+            let manager = crate::agent::AgentManager::for_vm(&tmp)?;
+            let mut client = manager.connect()?;
+            let pulled = client
+                .query(image)?
+                .ok_or_else(|| Error::config("image seed", "builder did not cache its image"))?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| Error::config("image seed", e.to_string()))?;
+            let (config, layers) =
+                rt.block_on(crate::image_store::authorized_image_content(image, auth))?;
+            if pulled.digest != config || pulled.layers != layers {
+                return Err(Error::config(
+                    "image seed",
+                    "builder image differs from authorized registry image",
+                ));
+            }
             run(exe, &["machine", "stop", "--name", &tmp])?;
             let disk = crate::agent::vm_data_dir(&tmp)
                 .join(crate::storage::STORAGE_DISK_FILENAME)
@@ -222,6 +341,8 @@ mod linux {
             }
             let dir = seed.parent().expect("seed path has a parent");
             std::fs::create_dir_all(dir).map_err(|e| Error::config("image seed", e.to_string()))?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::config("image seed", e.to_string()))?;
             std::fs::rename(&disk, &staging).map_err(|e| Error::config("image seed", e.to_string()))
         })();
         let _ = run(exe, &["machine", "delete", "--name", &tmp, "-f"]);
@@ -239,8 +360,8 @@ mod linux {
         Ok(())
     }
 
-    /// Make a finished builder disk the seed: owned by this user, readable by every
-    /// machine's VMM whatever its uid, writable by none.
+    /// Publish the seed privately. A dropped VMM uid sees its selected seed
+    /// through a read-only idmapped mount in its private mount namespace.
     fn publish(staging: &Path, seed: &Path) -> Result<()> {
         let seed_error = |e: std::io::Error| Error::config("image seed", e.to_string());
         let file = std::fs::File::open(staging).map_err(seed_error)?;
@@ -248,12 +369,13 @@ mod linux {
             return Err(seed_error(std::io::Error::last_os_error()));
         }
         file.sync_all().map_err(seed_error)?;
-        std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o444))
+        std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o400))
             .map_err(seed_error)?;
-        for dir in [seed.parent().expect("seed path has a parent"), &seed_root()] {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
-                .map_err(seed_error)?;
-        }
+        std::fs::set_permissions(
+            seed.parent().expect("seed path has a parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .map_err(seed_error)?;
         std::fs::rename(staging, seed).map_err(seed_error)
     }
 
@@ -314,6 +436,9 @@ mod linux {
     /// is only evicted when no disk image under smolvm's cache backs onto it: every
     /// machine, fork generation and paused disk that uses one keeps it.
     fn prune(root: &Path, max_bytes: u64, keep: &Path) {
+        let Ok(_cache) = CacheLock::exclusive(root) else {
+            return;
+        };
         let Ok(entries) = std::fs::read_dir(root) else {
             return;
         };
@@ -329,11 +454,14 @@ mod linux {
         if total <= max_bytes {
             return;
         }
-        let referenced = backing_references(
+        let Ok(referenced) = backing_references(
             &crate::agent::vm_cache_root()
                 .parent()
                 .map_or_else(crate::agent::vm_cache_root, Path::to_path_buf),
-        );
+        ) else {
+            // An incomplete scan cannot prove an old seed is unreferenced.
+            return;
+        };
         seeds.sort_by_key(|(_, _, used)| *used);
         for (seed, bytes, _) in seeds {
             if total <= max_bytes {
@@ -353,7 +481,6 @@ mod linux {
                 continue;
             };
             if std::fs::remove_dir_all(dir).is_ok() {
-                let _ = std::fs::remove_file(&lock);
                 total = total.saturating_sub(bytes);
                 tracing::info!(seed = %seed.display(), "evicted image seed");
             }
@@ -362,24 +489,25 @@ mod linux {
 
     /// Every backing file named by a qcow2 image under `dir`, recursively (seeds
     /// themselves excluded).
-    fn backing_references(dir: &Path) -> std::collections::HashSet<PathBuf> {
+    fn backing_references(dir: &Path) -> std::io::Result<std::collections::HashSet<PathBuf>> {
         let mut found = std::collections::HashSet::new();
         let mut stack = vec![dir.to_path_buf()];
         let seeds = seed_root();
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
+            let entries = std::fs::read_dir(&dir)?;
+            for entry in entries {
+                let entry = entry?;
                 let path = entry.path();
-                let Ok(kind) = entry.file_type() else {
-                    continue;
-                };
+                let kind = entry.file_type()?;
                 if kind.is_dir() {
                     if path != seeds {
                         stack.push(path);
                     }
                 } else if kind.is_file() {
+                    if path.extension().is_some_and(|ext| ext == "qcow2") {
+                        // Treat unreadable disk headers as an incomplete scan.
+                        let _ = std::fs::File::open(&path)?;
+                    }
                     if let Some(backing) = qcow2_backing(&path) {
                         let backing = if backing.is_absolute() {
                             backing
@@ -391,7 +519,7 @@ mod linux {
                 }
             }
         }
-        found
+        Ok(found)
     }
 
     /// The backing file a qcow2 image names in its header, if it is one.
@@ -459,25 +587,50 @@ mod linux {
 
     struct Lock(std::fs::File);
 
+    struct CacheLock {
+        _lock: Lock,
+    }
+
+    impl CacheLock {
+        fn shared(root: &Path) -> Result<Self> {
+            Lock::with_mode(&root.join(".cache.lock"), libc::LOCK_SH)
+                .map(|lock| Self { _lock: lock })
+        }
+
+        fn exclusive(root: &Path) -> Result<Self> {
+            Lock::with_mode(&root.join(".cache.lock"), libc::LOCK_EX)
+                .map(|lock| Self { _lock: lock })
+        }
+    }
+
     impl Lock {
         fn open(path: &Path) -> Result<std::fs::File> {
+            use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
                 .write(true)
                 .open(path)
                 .map_err(|e| Error::config("image seed lock", e.to_string()))
         }
 
-        fn exclusive(path: &Path) -> Result<Self> {
+        fn with_mode(path: &Path, mode: libc::c_int) -> Result<Self> {
             let file = Self::open(path)?;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| Error::config("image seed lock", e.to_string()))?;
+            if unsafe { libc::flock(file.as_raw_fd(), mode) } != 0 {
                 return Err(Error::config(
                     "image seed lock",
                     std::io::Error::last_os_error().to_string(),
                 ));
             }
             Ok(Self(file))
+        }
+
+        fn exclusive(path: &Path) -> Result<Self> {
+            Self::with_mode(path, libc::LOCK_EX)
         }
 
         fn try_exclusive(path: &Path) -> Option<Self> {
