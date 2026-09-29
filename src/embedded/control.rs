@@ -42,6 +42,13 @@ pub struct MachineSpec {
     /// This is persisted in the VM record so an SDK-created fork base remains
     /// forkable after its creating process exits and a later process reconnects.
     pub forkable: bool,
+    /// Whether the VM outlives the process that starts it. By default an
+    /// embedded machine's boot subprocess watches its parent and exits when
+    /// that parent dies, however it dies (see `LaunchFeatures::watch_parent`);
+    /// a detached machine keeps running and a later process reattaches with
+    /// `connect_machine`. Persisted so a restart by that later process stays
+    /// detached too.
+    pub detached: bool,
     /// Caller metadata, mirroring the CLI's `--label` and surfaced by
     /// `machine ls --json`. smolvm never interprets these.
     ///
@@ -89,6 +96,7 @@ impl MachineSpec {
         record.labels = self.labels.clone();
         record.ephemeral = !self.persistent;
         record.forkable = self.forkable;
+        record.detached = self.detached;
         record.runtime_managed = self.runtime_managed;
         record.remote_volumes = self.remote_volumes.clone();
         record
@@ -222,6 +230,13 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<Sta
 fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures) -> LaunchFeatures {
     if features.dns_filter_hosts.is_none() {
         features.dns_filter_hosts = record.dns_filter_hosts.clone();
+    }
+    // A detached machine stays detached on every launch — a plain start after
+    // a stop, a resume, a fork clone (which copies the golden's record) — not
+    // only the one that created it. A caller that decides explicitly still
+    // wins, as the CLI does for `machine run` versus `--detach`.
+    if features.watch_parent.is_none() && record.detached {
+        features.watch_parent = Some(false);
     }
     if !record.init_completed {
         features
@@ -860,6 +875,38 @@ mod tests {
         let record = spec.to_record();
         assert!(record.forkable);
         assert!(record.forkable_on_start());
+    }
+
+    #[test]
+    fn detached_record_disarms_the_parent_death_watchdog_on_every_launch() {
+        let mut spec = test_spec("hostd-owned", true);
+        spec.detached = true;
+        let record = spec.to_record();
+        assert!(record.detached);
+
+        // Every launch path that starts from the record — start, resume, a
+        // fork clone — inherits the opt-out without naming it.
+        let features = merge_record_launch_features(&record, LaunchFeatures::default());
+        assert_eq!(features.watch_parent, Some(false));
+
+        // An explicit caller decision is left alone in both directions.
+        let armed = LaunchFeatures {
+            watch_parent: Some(true),
+            ..LaunchFeatures::default()
+        };
+        assert_eq!(
+            merge_record_launch_features(&record, armed).watch_parent,
+            Some(true)
+        );
+
+        // A machine that did not ask keeps the default (armed under an
+        // in-process embedder).
+        let plain = test_spec("owned", true).to_record();
+        assert!(!plain.detached);
+        assert_eq!(
+            merge_record_launch_features(&plain, LaunchFeatures::default()).watch_parent,
+            None
+        );
     }
 
     #[test]

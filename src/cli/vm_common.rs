@@ -3099,6 +3099,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "entrypoint": record.entrypoint,
         "cmd": record.cmd,
         "ephemeral": record.ephemeral,
+        "detached": record.detached,
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
         "cuda": record.cuda,

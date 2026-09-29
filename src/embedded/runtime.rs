@@ -979,6 +979,21 @@ impl EmbeddedRuntime {
         handle.pull_image(image)
     }
 
+    /// Every machine in this host's shared DB, in name order. The DB is shared
+    /// with the CLI and every other embedder, so machines other processes own
+    /// are listed too — that is the point for a process reclaiming its own
+    /// after a restart, which tells them apart by `labels`. Resolve a live
+    /// state with [`state`](Self::state); the record's own is what was last
+    /// persisted.
+    pub fn list_machines(&self) -> Result<Vec<crate::config::VmRecord>> {
+        Ok(self
+            .db
+            .list_vms()?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect())
+    }
+
     /// List cached OCI images in the machine's storage.
     pub fn list_images(&self, name: &str) -> Result<Vec<ImageInfo>> {
         let handle = self.started_handle(name)?;
@@ -1533,6 +1548,27 @@ mod tests {
         assert_eq!(runtime.state("runtime-state"), "stopped");
         assert!(!runtime.is_running("runtime-state"));
         assert_eq!(runtime.pid("runtime-state"), None);
+    }
+
+    #[test]
+    fn list_machines_returns_every_record_by_name_with_its_labels() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let mut mine = test_spec("list-b", true);
+        mine.labels.insert("owner".into(), "hostd".into());
+        mine.detached = true;
+        runtime.create_machine(mine).unwrap();
+        runtime.create_machine(test_spec("list-a", false)).unwrap();
+
+        let listed = runtime.list_machines().unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["list-a", "list-b"]
+        );
+        let (a, b) = (&listed[0], &listed[1]);
+        assert!(a.ephemeral && a.labels.is_empty() && !a.detached);
+        assert!(!b.ephemeral && b.detached);
+        assert_eq!(b.labels.get("owner").map(String::as_str), Some("hostd"));
+        assert_eq!(runtime.state("list-b"), "stopped");
     }
 
     #[test]

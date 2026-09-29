@@ -613,6 +613,49 @@ impl CrunCommand {
     }
 }
 
+/// Bind crun's binary read-only onto itself, once at boot.
+///
+/// Every crun invocation otherwise copies its own binary into a sealed memfd and
+/// re-executes from it (its CVE-2019-5736 protection), about 2.5 ms per call in
+/// a 1-vCPU guest, and the agent runs crun for every container exec. crun skips
+/// that copy when its binary is on a read-only mount (`is_self_cloned` in
+/// libcrun's cloned_binary.c). The protection is the same: a container process
+/// cannot open a read-only mount for writing, nor remount one in the agent's
+/// mount namespace. On failure crun keeps cloning itself, as before.
+#[cfg(target_os = "linux")]
+pub fn protect_binary() {
+    let path = std::ffi::CString::new(paths::CRUN_PATH).expect("constant path has no NUL");
+    // SAFETY: mount(2) and umount2(2) on a constant, NUL-terminated path.
+    let bound = unsafe {
+        libc::mount(
+            path.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    } == 0;
+    if !bound {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "could not bind crun read-only; it will clone itself on every call");
+        return;
+    }
+    // SAFETY: as above; remounts only the bind created just now.
+    let read_only = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    } == 0;
+    if !read_only {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "could not make crun read-only; it will clone itself on every call");
+        // SAFETY: detaches the writable bind created above.
+        unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

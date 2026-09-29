@@ -1556,6 +1556,25 @@ fn shared_uid_owner_dir(
     Ok(owner)
 }
 
+/// The directory whose name keys a VM's uid allocation. A live-fork snapshot
+/// sits two levels inside its golden's data dir, so a clone keys on the golden.
+/// A restore's one-shot checkpoint sits inside the VM's own data dir, so its
+/// grandparent is the shared `vms` directory, never an owner.
+#[cfg(target_os = "linux")]
+fn vm_uid_key_dir<'a>(
+    data_dir: &'a std::path::Path,
+    snapshot_dir: Option<&'a std::path::Path>,
+    shared_owner: Option<&'a std::path::Path>,
+) -> &'a std::path::Path {
+    match (shared_owner, snapshot_dir) {
+        (Some(owner), _) => owner,
+        (None, Some(snap)) if !snap.starts_with(data_dir) => {
+            snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir)
+        }
+        _ => data_dir,
+    }
+}
+
 /// Allocate a VM identity, or borrow its snapshot/source directory's identity.
 /// Returns `None` when UID isolation is inactive; allocation errors must fail
 /// closed. Borrowers resolve to the registered owner, including when their
@@ -1585,11 +1604,7 @@ pub fn vm_drop_ids(
         }
         None => None,
     };
-    let key_dir = match (shared_owner.as_deref(), snapshot_dir) {
-        (Some(owner), _) => owner,
-        (None, Some(snap)) => snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir),
-        (None, None) => data_dir,
-    };
+    let key_dir = vm_uid_key_dir(data_dir, snapshot_dir, shared_owner.as_deref());
     let Some(vm_key) = key_dir.file_name().and_then(|n| n.to_str()) else {
         return Some(Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -4505,6 +4520,30 @@ mod tests {
             unsafe { libc::getuid() },
             1,
             "drop must not have taken effect"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_vm_keys_its_uid_on_its_own_data_dir() {
+        let vms = std::path::Path::new("/data/smolvm/vms");
+        let clone = vms.join("clone");
+        let golden = vms.join("golden");
+        let fork_snapshot = golden.join("s").join("0a1b2c3d");
+        assert_eq!(
+            vm_uid_key_dir(&clone, Some(&fork_snapshot), None),
+            golden.as_path()
+        );
+        let restored = vms.join("restored");
+        let pending = restored.join("portable-checkpoint");
+        assert_eq!(
+            vm_uid_key_dir(&restored, Some(&pending), None),
+            restored.as_path()
+        );
+        assert_eq!(vm_uid_key_dir(&restored, None, None), restored.as_path());
+        assert_eq!(
+            vm_uid_key_dir(&clone, Some(&fork_snapshot), Some(&restored)),
+            restored.as_path()
         );
     }
 

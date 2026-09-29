@@ -578,6 +578,15 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forkable: bool,
 
+    /// Boot without the parent-death watchdog, so the VM outlives whichever
+    /// process starts it. Set by an embedder (the SDK's `detach`) whose own
+    /// restarts must not take its machines down; it reattaches with
+    /// `connect`. Persisted, like `forkable`, so every later start honours it
+    /// and not only the creating one — a machine that survived a crash but
+    /// died with the next process to `start` it would be a trap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
+
     /// Planned number of runnable CUDA fork clones. Persisted so every clone
     /// receives the same pre-initialization VRAM policy as its golden.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -808,6 +817,7 @@ impl VmRecord {
             ssh_agent: false,
             cuda: false,
             forkable: false,
+            detached: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
@@ -890,6 +900,7 @@ impl VmRecord {
             ssh_agent: false,
             cuda: false,
             forkable: false,
+            detached: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,

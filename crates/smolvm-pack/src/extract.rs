@@ -1727,8 +1727,16 @@ pub fn extract_sidecar_for_agent(
         force,
         debug,
         true,
-        agent_version,
+        ExtractContext {
+            agent_version,
+            digest_out: None,
+        },
     )
+}
+
+struct ExtractContext<'a> {
+    agent_version: Option<&'a str>,
+    digest_out: Option<&'a mut Option<ExtractedArtifactDigest>>,
 }
 
 /// Core of [`extract_sidecar`]. `cap_cache` runs the LRU size-cap on
@@ -1749,8 +1757,12 @@ fn extract_sidecar_capped(
     force: bool,
     debug: bool,
     cap_cache: bool,
-    agent_version: Option<&str>,
+    context: ExtractContext<'_>,
 ) -> std::io::Result<()> {
+    let ExtractContext {
+        agent_version,
+        digest_out,
+    } = context;
     if !sidecar_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1815,7 +1827,14 @@ fn extract_sidecar_capped(
         let _ = fs::remove_dir_all(cache_dir);
     }
 
-    let result = extract_sidecar_inner(sidecar_path, cache_dir, footer, debug, agent_version);
+    let result = extract_sidecar_inner(
+        sidecar_path,
+        cache_dir,
+        footer,
+        debug,
+        agent_version,
+        digest_out,
+    );
 
     // If extraction failed mid-stream, partially extracted files remain on
     // disk without a completion marker. Subsequent retries hit the same
@@ -1992,11 +2011,23 @@ pub fn extract_sidecar_shared(
 ) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
     let was_extracted = is_extracted(&shared_dir);
+    let mut observed_digest = None;
     // cap_cache=false: never perform blind automatic LRU eviction here. Shared
     // entries are maintained explicitly by `smolvm pack prune`, which treats
     // each machine's `.pack-shared` pointer as a durable lease and therefore
     // cannot delete a pack mounted by a running or stopped VM.
-    extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false, None)?;
+    extract_sidecar_capped(
+        sidecar_path,
+        &shared_dir,
+        footer,
+        false,
+        debug,
+        false,
+        ExtractContext {
+            agent_version: None,
+            digest_out: cfg!(unix).then_some(&mut observed_digest),
+        },
+    )?;
     let overlap = cfg!(target_os = "linux")
         && !was_extracted
         && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
@@ -2006,10 +2037,20 @@ pub fn extract_sidecar_shared(
         let memory = shared_dir.join("checkpoint/memory.bin");
         overlap_checkpoint_writeback(
             || File::open(&memory)?.sync_all(),
-            || ensure_shared_artifact_sha256(sidecar_path, &shared_dir),
+            || {
+                ensure_shared_artifact_sha256_with_observed(
+                    sidecar_path,
+                    &shared_dir,
+                    observed_digest.as_mut(),
+                )
+            },
         )?;
     } else {
-        ensure_shared_artifact_sha256(sidecar_path, &shared_dir)?;
+        ensure_shared_artifact_sha256_with_observed(
+            sidecar_path,
+            &shared_dir,
+            observed_digest.as_mut(),
+        )?;
     }
     // Lock down the store so a dropped per-VM uid can't read the shared copy
     // directly (it must go through its idmapped mount). Best-effort: traversal
@@ -2356,6 +2397,149 @@ fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
     Ok(digest)
 }
 
+/// Hash the exact compressed bytes consumed by extraction on a bounded worker.
+/// The reader also consumes the trailing manifest and footer before the proof
+/// can be used, so the digest names the entire artifact rather than only the
+/// zstd stream. The worker can finish while checkpoint RAM is being synced.
+struct ExtractDigestWorker {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    worker: Option<std::thread::JoinHandle<String>>,
+}
+
+impl ExtractDigestWorker {
+    fn spawn() -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let worker = std::thread::Builder::new()
+            .name("extract-sha256".into())
+            .spawn(move || {
+                let mut hasher = Context::new(&SHA256);
+                for bytes in receiver {
+                    hasher.update(&bytes);
+                }
+                let mut digest = String::with_capacity(64);
+                for byte in hasher.finish().as_ref() {
+                    write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+                }
+                digest
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn update(&self, bytes: &[u8]) -> bool {
+        bytes.chunks(1024 * 1024).all(|chunk| {
+            self.sender
+                .as_ref()
+                .is_some_and(|sender| sender.send(chunk.to_vec()).is_ok())
+        })
+    }
+
+    fn finish(mut self) -> Option<String> {
+        drop(self.sender.take());
+        self.worker.take()?.join().ok()
+    }
+}
+
+impl Drop for ExtractDigestWorker {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct ExtractDigestReader {
+    file: File,
+    before: Option<fs::Metadata>,
+    service_only_before: bool,
+    worker: Option<ExtractDigestWorker>,
+    bytes: u64,
+}
+
+impl ExtractDigestReader {
+    fn open(path: &Path, capture_digest: bool) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let before = capture_digest.then(|| file.metadata()).transpose()?;
+        let worker = if capture_digest {
+            ExtractDigestWorker::spawn().ok()
+        } else {
+            None
+        };
+        Ok(Self {
+            file,
+            before,
+            service_only_before: capture_digest && only_service_can_write(path),
+            worker,
+            bytes: 0,
+        })
+    }
+
+    fn finish(mut self) -> std::io::Result<Option<ExtractedArtifactDigest>> {
+        if self.worker.is_none() {
+            return Ok(None);
+        }
+        std::io::copy(&mut self, &mut std::io::sink())?;
+        let Some(before) = self.before else {
+            return Ok(None);
+        };
+        if self.bytes != before.len() {
+            return Ok(None);
+        }
+        Ok(self.worker.take().map(|worker| ExtractedArtifactDigest {
+            file: self.file,
+            before,
+            service_only_before: self.service_only_before,
+            worker: Some(worker),
+        }))
+    }
+}
+
+impl Read for ExtractDigestReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.file.read(bytes)?;
+        self.bytes = self.bytes.saturating_add(count as u64);
+        if count > 0
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.update(&bytes[..count]))
+        {
+            self.worker.take();
+        }
+        Ok(count)
+    }
+}
+
+struct ExtractedArtifactDigest {
+    file: File,
+    before: fs::Metadata,
+    service_only_before: bool,
+    worker: Option<ExtractDigestWorker>,
+}
+
+impl ExtractedArtifactDigest {
+    fn digest_for(&mut self, path: &Path) -> Option<String> {
+        // An open descriptor pins the inode through extraction and hashing.
+        // A changed descriptor or path cannot provide a cache identity.
+        let after = self.file.metadata().ok()?;
+        let path_after = fs::metadata(path).ok()?;
+        if !same_checkpoint_identity(&self.before, &after)
+            || !same_checkpoint_identity(&self.before, &path_after)
+        {
+            return None;
+        }
+        let digest = self.worker.take()?.finish()?;
+        let after = self.file.metadata().ok()?;
+        let path_after = fs::metadata(path).ok()?;
+        (same_checkpoint_identity(&self.before, &after)
+            && same_checkpoint_identity(&self.before, &path_after))
+        .then_some(digest)
+    }
+}
+
 #[test]
 fn artifact_hash_matches_existing_sha256_across_read_boundaries() {
     use sha2::{Digest, Sha256};
@@ -2408,10 +2592,31 @@ fn ensure_shared_artifact_sha256(
     ensure_shared_artifact_sha256_with_identity(sidecar_path, shared_dir, None)
 }
 
+fn ensure_shared_artifact_sha256_with_observed(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+    observed: Option<&mut ExtractedArtifactDigest>,
+) -> std::io::Result<String> {
+    if cfg!(unix) {
+        ensure_shared_artifact_sha256_with_proofs(sidecar_path, shared_dir, None, observed)
+    } else {
+        ensure_shared_artifact_sha256(sidecar_path, shared_dir)
+    }
+}
+
 fn ensure_shared_artifact_sha256_with_identity(
     sidecar_path: &Path,
     shared_dir: &Path,
     identity: Option<&crate::packer::PackedArtifactIdentity>,
+) -> std::io::Result<String> {
+    ensure_shared_artifact_sha256_with_proofs(sidecar_path, shared_dir, identity, None)
+}
+
+fn ensure_shared_artifact_sha256_with_proofs(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+    identity: Option<&crate::packer::PackedArtifactIdentity>,
+    observed: Option<&mut ExtractedArtifactDigest>,
 ) -> std::io::Result<String> {
     let digest_path = shared_artifact_sha256_path(shared_dir);
     let lock_path = digest_path.with_extension("artifact-sha256.lock");
@@ -2483,8 +2688,29 @@ fn ensure_shared_artifact_sha256_with_identity(
     let written_digest = identity.and_then(|identity| identity.digest_for(sidecar_path));
     source_identity.locally_produced =
         written_digest.is_some() && service_owned_artifact(sidecar_path);
-    let digest = match written_digest {
-        Some(digest) => digest.to_owned(),
+    let observed_digest = if written_digest.is_none() {
+        observed.and_then(|observed| {
+            observed
+                .digest_for(sidecar_path)
+                .map(|digest| (digest, observed.service_only_before))
+        })
+    } else {
+        None
+    };
+    let observed_service_only = observed_digest
+        .as_ref()
+        .is_some_and(|(_, trusted)| *trusted);
+    let digest = match written_digest
+        .map(str::to_owned)
+        .or_else(|| observed_digest.map(|(digest, _)| digest))
+    {
+        Some(digest) => {
+            if observed_service_only {
+                source_identity.hashed_while_service_only =
+                    hashed_while_service_only(sidecar_path, &source_identity, trusted_before)?;
+            }
+            digest
+        }
         None => {
             let digest = hash_artifact_sha256(sidecar_path)?;
             source_identity.hashed_while_service_only =
@@ -2940,6 +3166,7 @@ fn extract_sidecar_inner(
     footer: &PackFooter,
     debug: bool,
     agent_version: Option<&str>,
+    digest_out: Option<&mut Option<ExtractedArtifactDigest>>,
 ) -> std::io::Result<()> {
     fs::create_dir_all(cache_dir)?;
 
@@ -2951,23 +3178,23 @@ fn extract_sidecar_inner(
         );
     }
 
-    let sidecar_file = File::open(sidecar_path)?;
-    let limited_reader = sidecar_file.take(footer.assets_size);
-
-    let decoder = zstd::stream::Decoder::new(limited_reader)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let mut archive = tar::Archive::new(decoder);
+    let mut sidecar_file = ExtractDigestReader::open(sidecar_path, digest_out.is_some())?;
     let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
-    safe_unpack_with_policy(
-        &mut archive,
-        cache_dir,
-        &SafeUnpackLimits::from_env(),
-        manifest
-            .as_ref()
-            .is_some_and(|manifest| manifest.checkpoint.is_some()),
-        false,
-    )?;
+    {
+        let limited_reader = (&mut sidecar_file).take(footer.assets_size);
+        let decoder = zstd::stream::Decoder::new(limited_reader)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut archive = tar::Archive::new(decoder);
+        safe_unpack_with_policy(
+            &mut archive,
+            cache_dir,
+            &SafeUnpackLimits::from_env(),
+            manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.checkpoint.is_some()),
+            false,
+        )?;
+    }
 
     if debug {
         eprintln!("debug: extracted assets to {}", cache_dir.display());
@@ -3030,6 +3257,9 @@ fn extract_sidecar_inner(
         debug,
         host_layers,
     )?;
+    if let Some(slot) = digest_out {
+        *slot = sidecar_file.finish()?;
+    }
     Ok(())
 }
 
@@ -4390,6 +4620,45 @@ pub fn create_or_copy_storage_disk(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extraction_digest_covers_consumed_bytes_and_trailing_footer() {
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("checkpoint.smolcheckpoint");
+        let mut bytes = vec![0xA5; 1024 * 1024 + 17];
+        bytes.extend_from_slice(b"manifest-and-footer");
+        std::fs::write(&artifact, &bytes).unwrap();
+
+        let mut reader = super::ExtractDigestReader::open(&artifact, true).unwrap();
+        let mut first = [0_u8; 37];
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(first, bytes[..37]);
+        let mut observed = reader.finish().unwrap().unwrap();
+        assert_eq!(
+            observed.digest_for(&artifact).unwrap(),
+            super::hash_artifact_sha256(&artifact).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_digest_rejects_a_changed_inode_even_with_restored_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("checkpoint.smolcheckpoint");
+        std::fs::write(&artifact, b"original-bytes").unwrap();
+        let original_mtime = std::fs::metadata(&artifact).unwrap().modified().unwrap();
+        let reader = super::ExtractDigestReader::open(&artifact, true).unwrap();
+        let mut observed = reader.finish().unwrap().unwrap();
+
+        std::fs::write(&artifact, b"tampered-bytes").unwrap();
+        std::fs::File::open(&artifact)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        assert!(observed.digest_for(&artifact).is_none());
+    }
+
     #[test]
     fn local_digest_identity_ignores_only_path() {
         let original = super::ArtifactSourceIdentity {
