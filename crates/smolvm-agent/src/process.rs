@@ -251,6 +251,65 @@ pub fn is_peer_closed(_fd: std::os::unix::io::RawFd) -> bool {
     false
 }
 
+/// Receive `rx` into `buf` until its sender is gone or `deadline` passes.
+fn drain_until_closed(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+) {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(chunk) => buf.extend_from_slice(&chunk),
+            Err(_) => {
+                // Disconnected (reader finished) or out of time: take whatever
+                // arrived meanwhile and stop.
+                buf.extend(rx.try_iter().flatten());
+                return;
+            }
+        }
+    }
+}
+
+/// Wakes a waiter when a child exits: a pidfd that polls readable on exit.
+/// Without one (a kernel older than 5.3), waiting is a plain sleep.
+pub(crate) struct ExitSignal(#[cfg(target_os = "linux")] Option<std::os::fd::OwnedFd>);
+
+impl ExitSignal {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open(child: &Child) -> Self {
+        use std::os::fd::FromRawFd;
+        // SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+        // SAFETY: a non-negative return is a fresh fd this process owns.
+        Self((fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) }))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn open(_child: &Child) -> Self {
+        Self()
+    }
+
+    /// Return after `timeout`, or sooner if the child exits.
+    pub(crate) fn wait(&self, timeout: Duration) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.0 {
+            use std::os::fd::AsRawFd;
+            let mut pollfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+            // SAFETY: one valid pollfd. An EINTR or error only ends this wait
+            // early; the caller checks the child again either way.
+            unsafe { libc::poll(&mut pollfd, 1, ms) };
+            return;
+        }
+        std::thread::sleep(timeout);
+    }
+}
+
 /// Try to wait for a child process, handling EINTR by retrying.
 ///
 /// EINTR can occur when a signal is delivered during the wait syscall.
@@ -304,7 +363,7 @@ where
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
 
-    let stdout_handle = child.stdout.take().and_then(|mut out| {
+    let _stdout_reader = child.stdout.take().and_then(|mut out| {
         std::thread::Builder::new()
             .name("crun-stdout".into())
             .spawn(move || {
@@ -330,7 +389,7 @@ where
             .ok()
     });
 
-    let stderr_handle = child.stderr.take().and_then(|mut err| {
+    let _stderr_reader = child.stderr.take().and_then(|mut err| {
         std::thread::Builder::new()
             .name("crun-stderr".into())
             .spawn(move || {
@@ -362,6 +421,8 @@ where
 
     let poll_interval = Duration::from_millis(10);
     let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+    // Wakes the loop the moment the child exits, rather than at the next tick.
+    let exit_signal = ExitSignal::open(child);
 
     // Drain any available chunks from the channels into local buffers.
     let drain_channels = |stdout_rx: &mpsc::Receiver<Vec<u8>>,
@@ -383,21 +444,13 @@ where
         match try_wait_with_eintr(child) {
             Ok(Some(status)) => {
                 // Child exited — give reader threads a bounded window to finish.
-                // After the child dies, pipe write ends close and readers see EOF.
-                // Use is_finished() on handles to detect completion without consuming
-                // chunks (try_recv as a probe races and can drop data).
+                // After the child dies, pipe write ends close and readers see EOF;
+                // a reader's channel disconnects as soon as it returns, so wait on
+                // that instead of polling. A background process still holding a
+                // pipe keeps its reader open until the deadline, as before.
                 let join_deadline = Instant::now() + READER_JOIN_TIMEOUT;
-                while Instant::now() < join_deadline {
-                    drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
-                    let stdout_done = stdout_handle.as_ref().is_none_or(|h| h.is_finished());
-                    let stderr_done = stderr_handle.as_ref().is_none_or(|h| h.is_finished());
-                    if stdout_done && stderr_done {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                // Final drain after threads are done (or timed out).
-                drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
+                drain_until_closed(&stdout_rx, &mut stdout_buf, join_deadline);
+                drain_until_closed(&stderr_rx, &mut stderr_buf, join_deadline);
                 let exit_code = exit_code_from_status(&status);
                 return Ok(WaitResult::Completed {
                     exit_code,
@@ -439,7 +492,12 @@ where
                     }
                 }
 
-                std::thread::sleep(poll_interval);
+                let tick = deadline.map_or(poll_interval, |deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(poll_interval)
+                });
+                exit_signal.wait(tick);
             }
             Err(e) => return Err(e),
         }
@@ -486,6 +544,51 @@ mod tests {
                 .and_then(|s| parse_stat_state_ppid(&s))
                 .is_some_and(|(state, _)| state != 'Z');
             assert!(!alive, "descendant {pid} survived");
+        }
+    }
+
+    // A command that exits at once used to wait out a 10 ms poll tick, plus
+    // another while its output readers finished.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quick_command_returns_without_a_poll_tick() {
+        let mut best = Duration::MAX;
+        for _ in 0..20 {
+            let mut child = std::process::Command::new("true")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let result =
+                wait_with_timeout_cleanup_and_liveness(&mut child, None, None, || {}).unwrap();
+            best = best.min(started.elapsed());
+            assert!(matches!(result, WaitResult::Completed { exit_code: 0, .. }));
+        }
+        assert!(
+            best < Duration::from_millis(8),
+            "fastest wait took {best:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_is_complete_when_the_child_exits() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "head -c 300000 /dev/zero; echo err >&2"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        match wait_with_timeout_cleanup_and_liveness(&mut child, Some(10_000), None, || {}).unwrap()
+        {
+            WaitResult::Completed { output, .. } => {
+                assert_eq!(output.stdout.len(), 300_000);
+                assert_eq!(output.stderr, b"err\n");
+            }
+            _ => panic!("expected the command to complete"),
         }
     }
 

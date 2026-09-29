@@ -7096,6 +7096,8 @@ fn handle_vm_exec(
     // Wait for exit with timeout
     let deadline =
         timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+    // Wakes the loop the moment the child exits, rather than at the next tick.
+    let exit_signal = process::ExitSignal::open(&child);
 
     let exit_code = loop {
         match child.try_wait() {
@@ -7135,7 +7137,12 @@ fn handle_vm_exec(
                         break 124; // Standard timeout exit code
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(PROCESS_POLL_INTERVAL_MS));
+                let tick = std::time::Duration::from_millis(PROCESS_POLL_INTERVAL_MS);
+                exit_signal.wait(deadline.map_or(tick, |deadline| {
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(tick)
+                }));
             }
             Err(e) => {
                 return AgentResponse::error(
