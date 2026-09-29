@@ -2330,12 +2330,38 @@ async fn create_machine_inner(
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
 
+    // A registry-image machine gets its storage disk on a shared seed of its
+    // image (see `image_seed`), so its first start skips the pull. The manager
+    // below then opens that disk instead of creating a blank one.
+    let seed_image = (source_smolmachine.is_none()
+        && manifest_checkpoint.is_none()
+        && vm_seed.is_none())
+    .then(|| crate::image_seed::seedable_image(&name, image.as_deref(), restored_storage_gb))
+    .flatten();
+
     // Create manager (does not boot the VM)
     let mut manager = tokio::task::spawn_blocking({
         let name = name.clone();
         let storage_gb = restored_storage_gb;
         let overlay_gb = restored_overlay_gb;
         move || {
+            if let Some(image) = seed_image {
+                let seeded = std::env::current_exe()
+                    .map_err(|e| crate::Error::config("image seed", e.to_string()))
+                    .and_then(|exe| {
+                        crate::image_seed::seed_storage(
+                            &exe,
+                            &name,
+                            &image,
+                            &crate::registry::PullAuth::FromConfig,
+                            None,
+                            None,
+                        )
+                    });
+                if let Err(error) = seeded {
+                    tracing::warn!(machine = %name, %error, "no image seed; pulling in the guest");
+                }
+            }
             AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
                 .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))
         }
@@ -3089,7 +3115,27 @@ pub async fn start_machine(
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     let restore_record = record.clone();
     let forkable = query.forkable || query.fork_pool_size.is_some() || record.forkable_on_start();
+    // A fresh registry-image machine starts on a shared seed of its image (see
+    // `image_seed`), authorized with the caller's registry credentials.
+    let seed_image = crate::image_seed::wants_seed(&name, &record, restoring_checkpoint);
+    let seed_auth = match &registry_auth {
+        Some(auth) => crate::registry::PullAuth::Basic {
+            username: auth.username.clone(),
+            password: auth.password.clone(),
+        },
+        None => crate::registry::PullAuth::FromConfig,
+    };
     let (manager, pid) = tokio::task::spawn_blocking(move || {
+        if let Some(image) = seed_image {
+            let seeded = std::env::current_exe()
+                .map_err(|e| crate::Error::config("image seed", e.to_string()))
+                .and_then(|exe| {
+                    crate::image_seed::seed_storage(&exe, &name_clone, &image, &seed_auth, None, None)
+                });
+            if let Err(error) = seeded {
+                tracing::warn!(machine = %name_clone, %error, "no image seed; pulling in the guest");
+            }
+        }
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 

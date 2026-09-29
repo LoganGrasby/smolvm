@@ -1750,6 +1750,27 @@ fn start_vm_named_with_db(
         check_port_conflicts(name, &ports, db)?;
     }
 
+    // A fresh registry-image machine starts on a shared seed of its image, so
+    // the guest finds the image already pulled. Best-effort: without a seed the
+    // guest pulls as before.
+    if let Some(image) = smolvm::image_seed::wants_seed(name, &record, from_snapshot) {
+        let seeded = std::env::current_exe()
+            .map_err(|e| Error::config("image seed", e.to_string()))
+            .and_then(|exe| {
+                smolvm::image_seed::seed_storage(
+                    &exe,
+                    name,
+                    &image,
+                    &smolvm::registry::PullAuth::FromConfig,
+                    proxy,
+                    no_proxy,
+                )
+            });
+        if let Err(error) = seeded {
+            tracing::warn!(machine = name, %error, "no image seed; pulling in the guest");
+        }
+    }
+
     // Start agent VM
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;

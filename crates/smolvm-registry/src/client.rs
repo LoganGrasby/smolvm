@@ -763,6 +763,52 @@ impl RegistryClient {
         read_body_capped(resp, MAX_MANIFEST_BYTES, "manifest").await
     }
 
+    /// The content digest the registry reports for `reference` (a tag or
+    /// digest), from a HEAD request: one authorized round-trip, no body, and on
+    /// Docker Hub not counted against the pull rate limit. The digest is of the
+    /// document the tag points to, an image index for a multi-arch image.
+    pub async fn head_manifest_digest(&self, repo: &str, reference: &str) -> Result<String> {
+        let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
+        let resp = self
+            .send_replayable(self.request(reqwest::Method::HEAD, &url).header(
+                ACCEPT,
+                format!(
+                    "{INDEX_MEDIA_TYPE}, {MANIFEST_MEDIA_TYPE}, \
+                     application/vnd.docker.distribution.manifest.list.v2+json, \
+                     application/vnd.docker.distribution.manifest.v2+json"
+                ),
+            ))
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(format!("{repo}:{reference}")));
+        }
+        if !resp.status().is_success() {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: String::new(),
+            });
+        }
+        let digest = resp
+            .headers()
+            .get("docker-content-digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                RegistryError::InvalidManifest(format!(
+                    "{repo}:{reference}: no Docker-Content-Digest in the manifest HEAD response"
+                ))
+            })?;
+        validate_digest(&digest)?;
+        // A digest reference must come back as itself.
+        if reference.starts_with("sha256:") && digest != reference {
+            return Err(RegistryError::DigestMismatch {
+                expected: reference.to_string(),
+                actual: digest,
+            });
+        }
+        Ok(digest)
+    }
+
     /// Fetch a manifest OR image index by reference, returning the raw bytes and
     /// the document's media type. Unlike [`get_manifest`], this accepts (and does
     /// not reject) an image index — the caller decides whether to resolve it to a

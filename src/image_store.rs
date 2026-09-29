@@ -34,6 +34,29 @@ pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<Strin
     Ok(manifest_digest(&manifest_bytes))
 }
 
+/// The digest `reference` currently points to (for a multi-arch tag, its image
+/// index), authorized with `auth`, from a single manifest HEAD. The registry
+/// authorizes `repository:<repo>:pull` for the request exactly as it does for a
+/// GET, so this is the same gate as [`authorized_digest`] at a fraction of the
+/// cost. A caller keying cached content on it must add the platform.
+pub async fn authorized_reference_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+    let parsed = Reference::parse(reference)
+        .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
+    let want = parsed
+        .digest
+        .clone()
+        .or_else(|| parsed.tag.clone())
+        .unwrap_or_else(|| "latest".to_string());
+    let config = crate::SmolSettings::load()?.images;
+    let host = crate::registry::extract_registry(reference);
+    let client = registry_client(&host, &config, auth);
+    let repo = repo_for(&host, &parsed);
+    client
+        .head_manifest_digest(&repo, &want)
+        .await
+        .map_err(|e| Error::agent("image-auth", e.to_string()))
+}
+
 /// The image's default command, resolved without pulling its layers.
 ///
 /// The `--oci-cache` run path needs the image's declared ENTRYPOINT/CMD to run
