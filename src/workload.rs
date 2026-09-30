@@ -158,18 +158,19 @@ fn is_image_missing(message: &str) -> bool {
 /// workload can run — minutes of silence that read as a hang. After a short
 /// grace period this prints an elapsed-time line to stderr: rewritten in
 /// place on a terminal, one line every 30 s when piped. Dropping the guard
-/// stops the ticker and clears the line.
+/// stops the ticker and clears the line. The ticker waits on a channel rather
+/// than sleeping, so dropping it returns at once: an ordinary start finishes
+/// well inside one tick and must not wait out the rest of it.
 struct WaitTicker {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WaitTicker {
     fn start(what: &'static str) -> Self {
         use std::io::{IsTerminal, Write};
-        use std::sync::atomic::Ordering;
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_flag = stop.clone();
+        use std::sync::mpsc::RecvTimeoutError;
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             let started = std::time::Instant::now();
             let tty = std::io::stderr().is_terminal();
@@ -180,8 +181,10 @@ impl WaitTicker {
                 std::time::Duration::from_secs(30)
             };
             let mut printed = false;
-            while !stop_flag.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(250));
+            // Wakes on the tick, or at once when the guard drops the sender.
+            while let Err(RecvTimeoutError::Timeout) =
+                stopped.recv_timeout(std::time::Duration::from_millis(250))
+            {
                 if started.elapsed() < grace {
                     continue;
                 }
@@ -209,7 +212,7 @@ impl WaitTicker {
             }
         });
         Self {
-            stop,
+            stop: Some(stop),
             handle: Some(handle),
         }
     }
@@ -217,7 +220,8 @@ impl WaitTicker {
 
 impl Drop for WaitTicker {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Disconnecting the channel wakes the ticker immediately.
+        drop(self.stop.take());
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -226,6 +230,21 @@ impl Drop for WaitTicker {
 
 #[cfg(test)]
 mod tests {
+    // Dropping the ticker used to wait out the rest of a 250 ms sleep, which
+    // every quick workload launch paid.
+    #[test]
+    fn dropping_the_ticker_returns_at_once() {
+        let ticker = super::WaitTicker::start("test");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        drop(ticker);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     use super::*;
 
     // An image the guest dropped (its layers stopped verifying after an
