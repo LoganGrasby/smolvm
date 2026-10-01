@@ -48,13 +48,13 @@ pub(crate) const LEGACY_PACKED_LAYERS_DAX_WINDOW: u64 = DATA_DAX_WINDOW;
 /// (the window its guest booted with).
 const PACKED_LAYERS_WINDOW_FILE: &str = "packed-layers-dax-window";
 
-/// DAX window for immutable packed image layers. These layers are the main
-/// cross-VM filesystem-sharing surface, but must follow the same architecture
-/// gate as the root filesystem because the arm64 guest kernel has no FUSE DAX.
-///
-/// Launchers without a recorded window (packed executables, which may embed a
-/// snapshot) keep the legacy size.
-pub fn packed_layers_dax_window() -> u64 {
+/// The legacy DAX window for immutable packed image layers, gated like the
+/// root filesystem because the arm64 guest kernel has no FUSE DAX. Not the
+/// fresh-boot size: it is for launches that cannot know the window a restored
+/// guest booted with (packed executables, which may embed a snapshot), so they
+/// map the largest one. Machines launched by the manager use
+/// `packed_layers_window_for_launch`.
+pub fn legacy_packed_layers_dax_window() -> u64 {
     if VIRTIOFS_DAX_SUPPORTED {
         LEGACY_PACKED_LAYERS_DAX_WINDOW
     } else {
@@ -203,14 +203,14 @@ mod tests {
     #[test]
     fn dax_windows_follow_architecture_support() {
         if cfg!(target_arch = "x86_64") {
-            assert_eq!(packed_layers_dax_window(), DATA_DAX_WINDOW);
+            assert_eq!(legacy_packed_layers_dax_window(), DATA_DAX_WINDOW);
             assert_eq!(
                 user_mount_dax_window(Path::new("/opt/smolvm-ring")),
                 CUDA_RING_DAX_WINDOW
             );
         } else {
             assert_eq!(rootfs_dax_window(), 0);
-            assert_eq!(packed_layers_dax_window(), 0);
+            assert_eq!(legacy_packed_layers_dax_window(), 0);
             assert_eq!(user_mount_dax_window(Path::new("/opt/smolvm-ring")), 0);
         }
     }

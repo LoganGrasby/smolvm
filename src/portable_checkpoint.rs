@@ -3465,7 +3465,7 @@ fn max_checkpoint_memory_image(memory_mib: u32, packed_layers: bool) -> Result<u
     // Bound by the largest window a packed-layer guest has booted with, so
     // checkpoints taken before the window shrank still pass.
     let packed_layers_window = if packed_layers {
-        crate::agent::virtiofs::packed_layers_dax_window()
+        crate::agent::virtiofs::legacy_packed_layers_dax_window()
     } else {
         0
     };
@@ -5069,8 +5069,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn install_verifies_and_consumes_checkpoint() {
+    /// An extracted checkpoint with raw storage and overlay disks, ready to install.
+    fn installable_checkpoint() -> (tempfile::TempDir, PortableCheckpointManifest) {
         let extracted = tempfile::tempdir().unwrap();
         let source = extracted.path().join(ASSET_DIR);
         std::fs::create_dir(&source).unwrap();
@@ -5126,6 +5126,13 @@ mod tests {
             history: Vec::new(),
             credential_ca: None,
         };
+        (extracted, metadata)
+    }
+
+    #[test]
+    fn install_verifies_and_consumes_checkpoint() {
+        let (extracted, metadata) = installable_checkpoint();
+        let source = extracted.path().join(ASSET_DIR);
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
         assert!(metadata.memory.sha256.is_empty());
@@ -5271,6 +5278,42 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn an_installed_checkpoint_restores_with_the_window_its_guest_booted_with() {
+        if crate::agent::virtiofs::legacy_packed_layers_dax_window() == 0 {
+            return;
+        }
+        let (extracted, mut metadata) = installable_checkpoint();
+        metadata.device_profile = DEVICE_PROFILE_PACKED_LAYERS.to_string();
+        let mut installed_window = |dax_window_bytes: Option<u64>| {
+            metadata.packed_layers = Some(CheckpointPackedLayers {
+                artifact_sha256: "ab".repeat(32),
+                footer_checksum: 7,
+                registry_ref: None,
+                dax_window_bytes,
+            });
+            let machine = tempfile::tempdir().unwrap();
+            install_with(extracted.path(), machine.path(), &metadata, true).unwrap();
+            let pending = pending_dir(machine.path()).unwrap();
+            crate::agent::virtiofs::packed_layers_window_for_launch(Some(&pending))
+        };
+        // A guest that booted in the small window restores into it.
+        assert_eq!(
+            installed_window(Some(crate::agent::virtiofs::PACKED_LAYERS_DAX_WINDOW)),
+            crate::agent::virtiofs::PACKED_LAYERS_DAX_WINDOW
+        );
+        // A checkpoint taken before windows were recorded gets the legacy window.
+        assert_eq!(
+            installed_window(None),
+            crate::agent::virtiofs::LEGACY_PACKED_LAYERS_DAX_WINDOW
+        );
+        // So does one recording a window libkrun cannot map.
+        assert_eq!(
+            installed_window(Some(12345)),
+            crate::agent::virtiofs::LEGACY_PACKED_LAYERS_DAX_WINDOW
+        );
+    }
+
     #[test]
     fn installed_private_metadata_does_not_share_ownership_with_cache_or_siblings() {
         use std::os::unix::fs::MetadataExt;
