@@ -2468,10 +2468,16 @@ fn checkpoint_packed_layers(name: &str, vm: &VmRecord) -> Result<Option<Checkpoi
             .put_file_verified(&digest, sidecar)
             .map_err(|error| Error::agent("cache checkpoint pack", error.to_string()))?;
     }
+    // The window this machine's running guest booted with, when recorded for
+    // its current VMM; otherwise restores use the legacy window.
+    let dax_window_bytes = vm.pid.zip(vm.pid_start_time).and_then(|(pid, start)| {
+        crate::agent::virtiofs::running_window(&crate::agent::vm_data_dir(name), pid as u32, start)
+    });
     Ok(Some(CheckpointPackedLayers {
         artifact_sha256: digest.trim_start_matches("sha256:").to_string(),
         footer_checksum: footer.checksum,
         registry_ref: vm.source_registry_ref.clone(),
+        dax_window_bytes,
     }))
 }
 
@@ -3456,6 +3462,8 @@ fn describe_sparse_asset(path: &Path, relative_path: &str) -> Result<CheckpointA
 /// Bound a RAM image by configured guest RAM and the devices' mapped windows.
 /// Capture and restore must use the same bound for packed-layer machines.
 fn max_checkpoint_memory_image(memory_mib: u32, packed_layers: bool) -> Result<u64> {
+    // Bound by the largest window a packed-layer guest has booted with, so
+    // checkpoints taken before the window shrank still pass.
     let packed_layers_window = if packed_layers {
         crate::agent::virtiofs::packed_layers_dax_window()
     } else {
@@ -4083,6 +4091,17 @@ fn install_with(
         .map_err(|error| Error::agent("create checkpoint directory", error.to_string()))?;
 
     let result = (|| -> Result<()> {
+        // The restore launches from this directory: record the window its
+        // guest booted with, so the restored VM maps at least that much.
+        if let Some(packed) = &checkpoint.packed_layers {
+            crate::agent::virtiofs::record_snapshot_window(
+                &partial,
+                packed
+                    .dax_window_bytes
+                    .unwrap_or(crate::agent::virtiofs::LEGACY_PACKED_LAYERS_DAX_WINDOW),
+            )
+            .map_err(|e| Error::agent("record checkpoint DAX window", e.to_string()))?;
+        }
         for (asset, expected) in expected_assets(checkpoint) {
             let started = std::time::Instant::now();
             if asset.path != expected {
@@ -5861,6 +5880,7 @@ mod tests {
             artifact_sha256: "ab".repeat(32),
             footer_checksum: 7,
             registry_ref: Some("registry.example/library/alpine:latest".to_string()),
+            dax_window_bytes: None,
         };
         let mut metadata = minimal_checkpoint_manifest();
         validate_compatibility(&metadata).unwrap();
