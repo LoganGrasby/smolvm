@@ -197,6 +197,40 @@ pub struct ExecRequest {
     pub background: bool,
 }
 
+/// Request to amend a stopped machine's egress allow list: add or remove
+/// hosts, patterns, and CIDRs without replacing the whole policy. The same
+/// merge and guards as `machine update`.
+///
+/// `deny_unknown_fields`: a mis-cased field on a security posture must be a
+/// hard 400, never a silently dropped entry.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateEgressRequest {
+    /// Hostnames to allow; each covers the name and its subdomains.
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    /// Patterns to allow: an exact hostname, or `*.domain` for subdomains only.
+    #[serde(default)]
+    pub allow_host_patterns: Vec<String>,
+    /// CIDR ranges to allow.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    /// Allowed hostnames or patterns to remove, written as they were added.
+    #[serde(default)]
+    pub remove_allow_hosts: Vec<String>,
+    /// Allowed CIDR ranges to remove.
+    #[serde(default)]
+    pub remove_allow_cidrs: Vec<String>,
+    /// Restrict outbound to localhost: adds `127.0.0.0/8` and `::1/128` to
+    /// the allowed CIDRs, as `--outbound-localhost-only` does.
+    #[serde(default)]
+    pub outbound_localhost_only: bool,
+    /// Permit a removal that empties the list, which allows egress to every
+    /// host. Mirrors `--net` on `machine update`.
+    #[serde(default)]
+    pub allow_all: bool,
+}
+
 /// Environment variable.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct EnvVar {

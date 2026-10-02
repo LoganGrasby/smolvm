@@ -45,7 +45,7 @@ use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialValuesRequest, DeleteQuery, DeleteResponse,
     EgressEventsResponse, ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest,
     ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
-    ResourceSpec, StartMachineQuery,
+    ResourceSpec, StartMachineQuery, UpdateEgressRequest,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -5315,6 +5315,90 @@ pub async fn resize_machine(
         .await?
         .ok_or_else(|| {
             ApiError::NotFound(format!("machine '{}' disappeared during resize", name))
+        })?;
+
+    Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Amend a stopped machine's egress allow list.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/egress",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = UpdateEgressRequest,
+    responses(
+        (status = 200, description = "Egress updated", body = MachineInfo),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine must be stopped", body = ApiErrorResponse),
+        (status = 500, description = "Update failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn update_machine_egress(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateEgressRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    // Serialize against start/stop/delete on the same machine, as resize does:
+    // the stopped check below is only meaningful under the lifecycle lock.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock_owned().await;
+
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    let actual_state = record.actual_state();
+    match actual_state {
+        RecordState::Stopped | RecordState::Created => {}
+        _ => {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' must be stopped before its egress changes. Current state: {:?}",
+                name, actual_state
+            )));
+        }
+    }
+
+    // Normalize CIDRs with the CLI's parser, so a malformed entry is a 400
+    // here instead of a silently narrower or wider policy later.
+    let normalize = |cidrs: &[String]| -> Result<Vec<String>, ApiError> {
+        cidrs
+            .iter()
+            .map(|c| crate::smolfile::parse_cidr(c))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::BadRequest)
+    };
+    let update = crate::config::EgressUpdate {
+        allow_hosts: req.allow_hosts,
+        allow_host_patterns: req.allow_host_patterns,
+        allow_cidrs: normalize(&req.allow_cidrs)?,
+        remove_allow_hosts: req.remove_allow_hosts,
+        remove_allow_cidrs: normalize(&req.remove_allow_cidrs)?,
+        outbound_localhost_only: req.outbound_localhost_only,
+        allow_all: req.allow_all,
+    };
+
+    let next = record
+        .updated_egress(&update)
+        .map_err(|error| match error {
+            crate::Error::Config { .. } => ApiError::BadRequest(error.to_string()),
+            other => ApiError::from(other),
+        })?
+        .ok_or_else(|| ApiError::BadRequest("request contains no egress changes".into()))?;
+
+    let record = state
+        .update_vm(&name, move |r| {
+            r.network = next.network;
+            r.allowed_cidrs = next.allowed_cidrs.clone();
+            r.dns_filter_hosts = next.dns_filter_hosts.clone();
+        })
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("machine '{}' disappeared during update", name))
         })?;
 
     Ok(Json(record_to_info(&name, &record)))
