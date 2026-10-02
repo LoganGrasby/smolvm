@@ -1068,7 +1068,7 @@ impl WorkerBudget {
     fn acquire(self: &Arc<Self>, requested: usize) -> WorkerPermit {
         let previous = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 Some(used + requested.min(self.limit.saturating_sub(used)))
             })
             .expect("worker reservation always supplies a value");

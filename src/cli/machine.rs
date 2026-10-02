@@ -5733,90 +5733,22 @@ pub struct UpdateCmd {
 
 impl UpdateCmd {
     /// The record's egress after this update's allow-list flags, or `None`
-    /// when none were given. Hosts are stored as `machine create` stores them:
-    /// `--allow-host` bare (a name and its subdomains), `--allow-host-pattern`
-    /// strict-encoded. Removing the last entry would open egress to every
-    /// host, so that needs `--net` to say so.
+    /// when none were given. The merge and its guards live on the record
+    /// ([`smolvm::config::VmRecord::updated_egress`]), shared with the API's
+    /// egress endpoint.
     fn next_egress(
         &self,
         record: &smolvm::config::VmRecord,
     ) -> smolvm::Result<Option<smolvm::config::VmRecord>> {
-        use smolvm_protocol::host_pattern::encode_strict;
-        if self.allow_host.is_empty()
-            && self.allow_host_pattern.is_empty()
-            && self.allow_cidr.is_empty()
-            && !self.outbound_localhost_only
-            && self.remove_allow_host.is_empty()
-            && self.remove_allow_cidr.is_empty()
-        {
-            return Ok(None);
-        }
-        let mut hosts = record.dns_filter_hosts.clone().unwrap_or_default();
-        let mut cidrs = record.allowed_cidrs.clone().unwrap_or_default();
-        let was_restricted = !hosts.is_empty() || !cidrs.is_empty();
-
-        for host in &self.remove_allow_host {
-            let strict = encode_strict(host.trim()).ok();
-            let before = hosts.len();
-            hosts.retain(|stored| stored != host.trim() && Some(stored) != strict.as_ref());
-            if hosts.len() == before {
-                return Err(smolvm::Error::config(
-                    "update",
-                    format!("'{host}' is not in machine '{}''s allowed hosts", self.name),
-                ));
-            }
-        }
-        for cidr in &self.remove_allow_cidr {
-            let before = cidrs.len();
-            cidrs.retain(|stored| stored != cidr);
-            if cidrs.len() == before {
-                return Err(smolvm::Error::config(
-                    "update",
-                    format!("'{cidr}' is not in machine '{}''s allowed CIDRs", self.name),
-                ));
-            }
-        }
-        for host in &self.allow_host {
-            let host = host.trim();
-            // Validate the name the way a pattern would be, then keep the bare
-            // form for its apex-and-subdomains meaning.
-            encode_strict(host).map_err(|e| smolvm::Error::config("--allow-host", e))?;
-            if !hosts.iter().any(|stored| stored == host) {
-                hosts.push(host.to_string());
-            }
-        }
-        for pattern in &self.allow_host_pattern {
-            let encoded = encode_strict(pattern.trim())
-                .map_err(|e| smolvm::Error::config("--allow-host-pattern", e))?;
-            if !hosts.contains(&encoded) {
-                hosts.push(encoded);
-            }
-        }
-        for cidr in &self.allow_cidr {
-            if !cidrs.contains(cidr) {
-                cidrs.push(cidr.clone());
-            }
-        }
-        // `machine create --outbound-localhost-only` is sugar for these two
-        // entries (see `resolve_egress_flags`); update spells it the same way.
-        if self.outbound_localhost_only {
-            for cidr in ["127.0.0.0/8", "::1/128"] {
-                if !cidrs.iter().any(|stored| stored == cidr) {
-                    cidrs.push(cidr.to_string());
-                }
-            }
-        }
-
-        if was_restricted && hosts.is_empty() && cidrs.is_empty() && !self.net {
-            return Err(smolvm::Error::config(
-                "update",
-                "removing the last allowed host or CIDR would allow egress to every host; \
-                 pass --net as well to allow all, or --no-net to turn networking off",
-            ));
-        }
-        let mut next = record.clone();
-        next.replace_egress(true, cidrs, hosts)?;
-        Ok(Some(next))
+        record.updated_egress(&smolvm::config::EgressUpdate {
+            allow_hosts: self.allow_host.clone(),
+            allow_host_patterns: self.allow_host_pattern.clone(),
+            allow_cidrs: self.allow_cidr.clone(),
+            remove_allow_hosts: self.remove_allow_host.clone(),
+            remove_allow_cidrs: self.remove_allow_cidr.clone(),
+            outbound_localhost_only: self.outbound_localhost_only,
+            allow_all: self.net,
+        })
     }
 
     pub fn run(self) -> smolvm::Result<()> {

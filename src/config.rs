@@ -363,6 +363,42 @@ impl SmolvmConfig {
     }
 }
 
+/// One add/remove amendment to a stopped machine's egress allow list, applied
+/// by [`VmRecord::updated_egress`]. Shared by `machine update` and the API's
+/// egress endpoint so the two cannot drift.
+#[derive(Debug, Clone, Default)]
+pub struct EgressUpdate {
+    /// Hostnames to allow, bare: each covers the name and its subdomains.
+    pub allow_hosts: Vec<String>,
+    /// Patterns to allow: an exact hostname, or `*.domain` for subdomains only.
+    pub allow_host_patterns: Vec<String>,
+    /// CIDR ranges to allow, already normalized by the caller's parser.
+    pub allow_cidrs: Vec<String>,
+    /// Allowed hostnames or patterns to remove, written as they were added.
+    pub remove_allow_hosts: Vec<String>,
+    /// Allowed CIDR ranges to remove.
+    pub remove_allow_cidrs: Vec<String>,
+    /// Restrict outbound to localhost: sugar for allowing `127.0.0.0/8` and
+    /// `::1/128`, exactly as `machine create --outbound-localhost-only` adds
+    /// them. Undone entry by entry through `remove_allow_cidrs`.
+    pub outbound_localhost_only: bool,
+    /// Permit a removal that empties the list, which allows egress to every
+    /// host (`--net` on the CLI, `allowAll` on the API).
+    pub allow_all: bool,
+}
+
+impl EgressUpdate {
+    /// Whether this update changes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.allow_hosts.is_empty()
+            && self.allow_host_patterns.is_empty()
+            && self.allow_cidrs.is_empty()
+            && !self.outbound_localhost_only
+            && self.remove_allow_hosts.is_empty()
+            && self.remove_allow_cidrs.is_empty()
+    }
+}
+
 /// Record of a VM in the registry.
 ///
 /// This stores machine configuration only. Container configuration
@@ -1190,6 +1226,87 @@ impl VmRecord {
         Ok(())
     }
 
+    /// This record after one add/remove amendment of its egress allow list, or
+    /// `None` when the update is empty. Hosts are stored as `machine create`
+    /// stores them: `allow_hosts` bare (a name and its subdomains),
+    /// `allow_host_patterns` strict-encoded. Removing the last entry would open
+    /// egress to every host, so that needs `allow_all` to say so. Shared by
+    /// `machine update` and the API's egress endpoint; the full replace-style
+    /// checks (credentials, TSI, saved memory) run in [`Self::replace_egress`].
+    pub fn updated_egress(&self, update: &EgressUpdate) -> Result<Option<VmRecord>> {
+        use smolvm_protocol::host_pattern::encode_strict;
+        if update.is_empty() {
+            return Ok(None);
+        }
+        let mut hosts = self.dns_filter_hosts.clone().unwrap_or_default();
+        let mut cidrs = self.allowed_cidrs.clone().unwrap_or_default();
+        let was_restricted = !hosts.is_empty() || !cidrs.is_empty();
+
+        for host in &update.remove_allow_hosts {
+            let strict = encode_strict(host.trim()).ok();
+            let before = hosts.len();
+            hosts.retain(|stored| stored != host.trim() && Some(stored) != strict.as_ref());
+            if hosts.len() == before {
+                return Err(crate::Error::config(
+                    "update",
+                    format!("'{host}' is not in machine '{}''s allowed hosts", self.name),
+                ));
+            }
+        }
+        for cidr in &update.remove_allow_cidrs {
+            let before = cidrs.len();
+            cidrs.retain(|stored| stored != cidr);
+            if cidrs.len() == before {
+                return Err(crate::Error::config(
+                    "update",
+                    format!("'{cidr}' is not in machine '{}''s allowed CIDRs", self.name),
+                ));
+            }
+        }
+        for host in &update.allow_hosts {
+            let host = host.trim();
+            // Validate the name the way a pattern would be, then keep the bare
+            // form for its apex-and-subdomains meaning.
+            encode_strict(host).map_err(|e| crate::Error::config("allow host", e))?;
+            if !hosts.iter().any(|stored| stored == host) {
+                hosts.push(host.to_string());
+            }
+        }
+        for pattern in &update.allow_host_patterns {
+            let encoded = encode_strict(pattern.trim())
+                .map_err(|e| crate::Error::config("allow host pattern", e))?;
+            if !hosts.contains(&encoded) {
+                hosts.push(encoded);
+            }
+        }
+        for cidr in &update.allow_cidrs {
+            if !cidrs.contains(cidr) {
+                cidrs.push(cidr.clone());
+            }
+        }
+        // `machine create --outbound-localhost-only` is sugar for these two
+        // entries (see `resolve_egress_flags`); an update spells it the same way.
+        if update.outbound_localhost_only {
+            for cidr in ["127.0.0.0/8", "::1/128"] {
+                if !cidrs.iter().any(|stored| stored == cidr) {
+                    cidrs.push(cidr.to_string());
+                }
+            }
+        }
+
+        if was_restricted && hosts.is_empty() && cidrs.is_empty() && !update.allow_all {
+            return Err(crate::Error::config(
+                "update",
+                "removing the last allowed host or CIDR would allow egress to every host; \
+                 say so explicitly (--net on the CLI, allowAll on the API), or turn \
+                 networking off instead",
+            ));
+        }
+        let mut next = self.clone();
+        next.replace_egress(true, cidrs, hosts)?;
+        Ok(Some(next))
+    }
+
     /// The network this machine launches with. A credential policy steers the
     /// default backend to virtio-net, so anything that records or checks the
     /// backend (validation, checkpoint capture) must plan it the same way the
@@ -1236,6 +1353,62 @@ mod tests {
         let mut r = VmRecord::new("m".to_string(), 1, 512, vec![], ports, network);
         r.image = Some(image.to_string());
         r
+    }
+
+    #[test]
+    fn updated_egress_merges_dedupes_and_guards_the_last_entry() {
+        let mut record = VmRecord::new("e".to_string(), 1, 512, vec![], vec![], true);
+        record.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+
+        // Empty update is a no-op signal, not an error.
+        assert!(record
+            .updated_egress(&EgressUpdate::default())
+            .unwrap()
+            .is_none());
+
+        // Adds merge and never duplicate; hosts store bare, patterns encoded.
+        let next = record
+            .updated_egress(&EgressUpdate {
+                allow_cidrs: vec!["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()],
+                allow_hosts: vec!["example.com".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.allowed_cidrs.as_deref(),
+            Some(["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()].as_slice())
+        );
+        assert_eq!(
+            next.dns_filter_hosts.as_deref(),
+            Some(["example.com".to_string()].as_slice())
+        );
+
+        // Removing an entry that is not there names the problem.
+        let err = record
+            .updated_egress(&EgressUpdate {
+                remove_allow_cidrs: vec!["9.9.9.9/32".to_string()],
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("9.9.9.9/32"), "{err}");
+
+        // Removing the last entry needs allow_all to open egress on purpose.
+        let last = EgressUpdate {
+            remove_allow_cidrs: vec!["10.0.0.0/8".to_string()],
+            ..Default::default()
+        };
+        assert!(record.updated_egress(&last).is_err());
+        let opened = record
+            .updated_egress(&EgressUpdate {
+                allow_all: true,
+                ..last
+            })
+            .unwrap()
+            .unwrap();
+        assert!(opened.allowed_cidrs.is_none());
+        assert!(opened.network);
     }
 
     // The bug: `create` accepted this and every `start` died with a raw Go DNS

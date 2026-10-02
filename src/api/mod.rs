@@ -104,6 +104,7 @@ use state::ApiState;
         handlers::machines::sync_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
+        handlers::machines::update_machine_egress,
         handlers::machines::put_credential_values,
         handlers::machines::export_machine,
         // Pools
@@ -142,6 +143,7 @@ use state::ApiState;
         types::DeleteQuery,
         types::LogsQuery,
         types::ResizeMachineRequest,
+        types::UpdateEgressRequest,
         types::CredentialValuesRequest,
         types::ForkRequest,
         types::ForkReleaseRequest,
@@ -298,6 +300,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/resume", post(handlers::machines::resume_machine))
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
+        .route(
+            "/{id}/egress",
+            post(handlers::machines::update_machine_egress),
+        )
         .route(
             "/{id}/credential-values",
             put(handlers::machines::put_credential_values),
