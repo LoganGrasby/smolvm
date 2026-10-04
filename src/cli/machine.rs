@@ -513,6 +513,12 @@ pub struct RunCmd {
           value_parser = crate::cli::parsers::parse_size_bytes, help_heading = "Execution")]
     pub max_image_size: Option<u64>,
 
+    /// Reuse an image digest resolved at most this many seconds ago when
+    /// seeding, skipping the per-run registry check inside the window.
+    /// Default: resolve and authorize at the registry on every run.
+    #[arg(long, value_name = "SECONDS", help_heading = "Execution")]
+    pub seed_digest_ttl: Option<u64>,
+
     /// Run a packed `.smolmachine` artifact ephemerally (the VM is discarded on
     /// exit) — the one-shot equivalent of `machine create --from … + start`.
     /// CPU/memory fall back to the artifact's baked manifest unless overridden.
@@ -1760,6 +1766,7 @@ impl RunCmd {
             &vm_name,
             params.image.as_deref(),
             params.storage_gb,
+            self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
             self.proxy_opts.no_proxy().as_deref(),
         );
@@ -4844,6 +4851,12 @@ pub struct StartCmd {
     #[arg(long = "no-workload", hide = true)]
     pub no_workload: bool,
 
+    /// Reuse an image digest resolved at most this many seconds ago when
+    /// seeding the first start, skipping the per-start registry check inside
+    /// the window. Default: resolve and authorize at the registry every start.
+    #[arg(long, value_name = "SECONDS")]
+    pub seed_digest_ttl: Option<u64>,
+
     /// Route outbound TCP through a host interceptor. Requires
     /// SMOLVM_INTERCEPTOR_TOKEN (64 hex digits). Other outbound datagrams except DNS are denied.
     #[arg(long, value_name = "ADDR", requires = "name")]
@@ -4891,6 +4904,7 @@ impl StartCmd {
             vm_common::StartOptions {
                 no_workload: self.no_workload,
                 external_interceptor,
+                seed_digest_ttl: self.seed_digest_ttl,
             },
         ) {
             Ok(()) => Ok(()),

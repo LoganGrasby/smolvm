@@ -179,6 +179,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
+| `--nested-virt` | | run, create | Let the guest run its own VMs (nested KVM). Off by default; it exposes the host kernel's nested-KVM code to the guest, so enable it only for trusted workloads. Over the HTTP API it is `nestedVirt`, refused with 403 unless the server runs `smolvm serve --allow-nested-virt`. |
 | `--stop-on-exit` | | create | Stop the machine when its workload exits, whatever the exit status |
 
 ## Smolfile Reference
@@ -266,7 +267,7 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `--allow-cidr 10.0.0.0/8` enables egress only to specified IP ranges (implies `--net`)
 - `--allow-host` and `--allow-cidr` can be combined and used multiple times
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
-- `-p HOST:GUEST` forwards a host port to the VM (TCP)
+- `-p HOST:GUEST` forwards a host port to the VM (TCP). The server inside the machine must listen on `0.0.0.0` (not `127.0.0.1`): a server bound only to the guest's loopback is unreachable from the host, and connections are reset. `machine status` shows each published port's listening state.
 - `--guest-subnet 10.200.0.0/30` moves the guest link off the default `100.96.0.0/30` (gateway and resolver `.1`, guest `.2`; implies `--net`, virtio-net). Use it when the guest runs Tailscale, another VPN or carrier NAT that claims `100.64.0.0/10`, which otherwise routes the gateway away and breaks DNS. API: `guestSubnet` on create. Not combinable with `--network`
 - Smolfile: use `[network] allow_host_patterns` for exact/wildcard matching; `allow_hosts` retains legacy matching.
 
@@ -598,7 +599,7 @@ The `.smolmachine` manifest includes registry-oriented metadata:
 
 ## HTTP API
 
-Start with `smolvm serve start --listen 127.0.0.1:8080` or `smolvm serve start --listen $XDG_RUNTIME_DIR/smolvm.sock`. Key endpoints:
+Start with `smolvm serve start --listen 127.0.0.1:8080` or `smolvm serve start --listen $XDG_RUNTIME_DIR/smolvm.sock`. Machines that ask for nested virtualization (`nestedVirt`) are refused unless the server is started with `--allow-nested-virt`; turning it off again also keeps existing nested machines from starting. Key endpoints:
 
 ```
 POST   /api/v1/machines                    Create machine

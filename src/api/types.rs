@@ -22,7 +22,7 @@ pub type RequestSecretRefs = BTreeMap<String, smolvm_protocol::SecretRef>;
 
 /// Restart policy specification for machine creation.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RestartSpec {
     /// Restart policy: "never", "always", "on-failure", "unless-stopped".
     #[serde(default)]
@@ -34,6 +34,7 @@ pub struct RestartSpec {
 
 /// Mount specification (for requests).
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MountSpec {
     /// Host path to mount.
     #[schema(example = "/Users/me/code")]
@@ -69,6 +70,7 @@ pub struct MountInfo {
 
 /// Port mapping specification.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PortSpec {
     /// Port on the host.
     #[schema(example = 8080)]
@@ -80,7 +82,7 @@ pub struct PortSpec {
 
 /// VM resource specification.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ResourceSpec {
     /// Number of vCPUs.
     #[serde(default)]
@@ -101,6 +103,12 @@ pub struct ResourceSpec {
     /// bundled shims). Required on a golden that fork clones will train on.
     #[serde(default)]
     pub cuda: Option<bool>,
+    /// Expose the host's virtualization extensions so the guest can run its own
+    /// VMs (nested KVM). Refused unless the server runs with
+    /// `--allow-nested-virt`; it hands the guest the host kernel's nested-KVM
+    /// code, so enable it only for trusted workloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_virt: Option<bool>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     #[schema(example = 20)]
@@ -284,7 +292,7 @@ pub struct ExecResponse {
 /// registry. The control plane mints a pre-scoped OCI bearer (`push_token`)
 /// that authorizes the write against `reference_host`.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExportRequest {
     /// Repository to push into (e.g. `tenant/my-machine`).
     #[schema(example = "tenant/my-machine")]
@@ -319,7 +327,7 @@ pub struct ExportResponse {
 /// Request to pull a `.smolmachine` artifact into this node's blob cache ahead
 /// of any machine that needs it. See [`crate::api::handlers::prewarm`].
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WarmArtifactRequest {
     /// Full registry reference of the artifact to cache.
     #[schema(example = "registry.example.com/tenants/t/app:latest")]
@@ -420,7 +428,7 @@ pub struct ListImagesResponse {
 
 /// Request to pull an image.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PullImageRequest {
     /// Image reference.
     #[schema(example = "python:3.12-alpine")]
@@ -602,8 +610,15 @@ pub struct ApiErrorResponse {
 // ============================================================================
 
 /// Request to create a new machine.
+///
+/// `deny_unknown_fields`: create carries the machine's security posture
+/// (`allowedCidrs`, `allowedHosts`, `credentials`, `networkBackend`), and a
+/// misspelled or mis-cased entry used to be dropped silently, yielding a
+/// machine with wider network access than the caller asked for. Same rule as
+/// `ExecRequest`, and it applies to the nested specs too, so a typo inside
+/// `restart` or `mounts` is also a hard 400.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CreateMachineRequest {
     /// Machine name. Auto-generated if omitted.
     #[serde(default)]
@@ -633,6 +648,12 @@ pub struct CreateMachineRequest {
     /// Enable CUDA remoting (host NVIDIA GPU via the bundled shims).
     #[serde(default)]
     pub cuda: bool,
+    /// Expose the host's virtualization extensions so the guest can run its own
+    /// VMs (nested KVM). Refused with 403 unless the server runs with
+    /// `--allow-nested-virt`; it hands the guest the host kernel's nested-KVM
+    /// code, so enable it only for trusted workloads.
+    #[serde(default)]
+    pub nested_virt: bool,
     /// Ask compatible CUDA frameworks to graph safe compiled regions.
     /// Implies CUDA; arbitrary eager CUDA calls are not captured.
     #[serde(default)]
@@ -995,7 +1016,7 @@ pub struct StartMachineQuery {
 /// conventional for token-style credentials (`token`, `oauth2accesstoken`,
 /// a GitHub PAT username); what matters is the password.
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RegistryAuthSpec {
     /// Registry username.
     pub username: String,
@@ -1027,6 +1048,10 @@ impl From<RegistryAuthSpec> for crate::registry::RegistryAuth {
 ///
 /// Entirely optional so an older caller that sends no body keeps working
 /// unchanged — the route accepted only a query string before this existed.
+///
+/// Deliberately NOT `deny_unknown_fields`: the test below pins the contract
+/// that unrelated JSON deserializes to "no credentials", so an older control
+/// plane sending a newer body keeps starting machines.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StartMachineRequest {
@@ -1048,7 +1073,7 @@ pub struct StartMachineRequest {
 
 /// Host interceptor binding supplied in a machine start request.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExternalInterceptorSpec {
     /// Loopback listener address, for example `127.0.0.1:43123`.
     #[schema(value_type = String)]
@@ -1090,7 +1115,7 @@ impl ExternalInterceptorSpec {
 /// before each start. A machine whose bindings came in over this API resolves
 /// them from here and nowhere else.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CredentialValuesRequest {
     /// Binding name → value. Replaces whatever was supplied before; empty
     /// clears it.
@@ -1100,7 +1125,7 @@ pub struct CredentialValuesRequest {
 
 /// Request to branch a running, branchable source machine into a new child.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ForkRequest {
     /// Name for the new child machine.
     #[schema(example = "clone-1")]
@@ -1157,7 +1182,7 @@ pub type BranchRequest = ForkRequest;
 
 /// Assignment for one already-booted held fork slot.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ForkReleaseRequest {
     /// Job-specific KEY=VALUE parameters. A value replaces a same-named value
     /// installed while provisioning the slot.
@@ -1174,7 +1199,7 @@ pub type BranchReleaseRequest = ForkReleaseRequest;
 
 /// Request to create an automatically replenished pool of held fork workers.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CreateForkPoolRequest {
     /// Stable pool name.
     #[schema(example = "grpo-rollouts")]
@@ -1223,7 +1248,7 @@ pub type DeleteBranchPoolQuery = DeleteForkPoolQuery;
 
 /// Request to change a pool's clean-worker target.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ResizeForkPoolRequest {
     /// New number of clean workers to keep booted and ready.
     pub desired_ready: u32,
@@ -1514,6 +1539,48 @@ mod deny_unknown_field_tests {
             serde_json::json!({"image": "alpine", "command": ["true"], "bogus": 1})
         )
         .is_err());
+    }
+
+    /// The #1503 repro: `allowed_cidrs` in snake_case on create used to be
+    /// dropped silently, so the caller asked for a restricted machine and got
+    /// one with open egress. Now it is a 400 naming the field.
+    #[test]
+    fn create_request_rejects_snake_case_security_fields() {
+        let err = serde_json::from_value::<CreateMachineRequest>(serde_json::json!({
+            "name": "sandbox", "image": "alpine", "network": true,
+            "allowed_cidrs": ["10.0.0.0/8"]
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("allowed_cidrs"), "{err}");
+
+        // Fields nested under a struct that is not part of the request are
+        // rejected too, instead of the whole object being ignored.
+        assert!(
+            serde_json::from_value::<CreateMachineRequest>(serde_json::json!({
+                "name": "sandbox", "image": "alpine",
+                "resources": {"networkBackend": "tsi"}
+            }))
+            .is_err()
+        );
+
+        // Typos inside nested specs are also hard errors.
+        assert!(
+            serde_json::from_value::<CreateMachineRequest>(serde_json::json!({
+                "name": "sandbox", "image": "alpine",
+                "restart": {"policee": "always"}
+            }))
+            .is_err()
+        );
+    }
+
+    /// Start stays lenient on purpose: its own contract test pins that an
+    /// older control plane sending unrelated fields keeps starting machines.
+    /// This records the asymmetry so a future sweep does not flip it blindly.
+    #[test]
+    fn start_request_still_ignores_unknown_fields() {
+        let req: StartMachineRequest =
+            serde_json::from_value(serde_json::json!({"somethingElse": 1})).unwrap();
+        assert!(req.registry_auth.is_none());
     }
 }
 
