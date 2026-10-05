@@ -5327,6 +5327,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn installed_private_metadata_does_not_share_ownership_with_cache_or_siblings() {
         use std::os::unix::fs::MetadataExt;
