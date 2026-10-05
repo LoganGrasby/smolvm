@@ -3740,6 +3740,8 @@ pub async fn start_machine(
 
     // Capture start time for PID verification
     let pid_start_time = pid.and_then(process_start_time);
+    // Past the fatal pull above, the machine's storage holds its image.
+    let image_on_storage = record.image.is_some() && !restoring_checkpoint;
 
     // Persist state to database (off the reactor)
     let record = state
@@ -3747,6 +3749,9 @@ pub async fn start_machine(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            if image_on_storage {
+                r.mark_image_on_storage();
+            }
             // An explicit start re-enables supervision: clear the user-stopped
             // flag and reset the retry budget so a machine that previously
             // exhausted max_retries can be restarted and supervised again.
