@@ -827,10 +827,6 @@ pub(crate) fn build_vm_record_for(
         record.host_uid_owner = Some(record.name.clone());
     }
 
-    // A registry image with no network can never be pulled (the guest runs the
-    // pull), so refuse here rather than deferring to a `start` that must fail.
-    record.validate_image_fetchable()?;
-
     // Remote volumes mount into the workload container's namespace, so an
     // imageless machine has nowhere to put them, and they need network to
     // reach the bucket. Refuse at create instead of failing every start.
@@ -1716,6 +1712,17 @@ fn start_vm_named_with_db(
         db.update_vm(name, |r| r.cuda_vram_limit_mib = Some(limit_mib))?;
     }
 
+    // A machine with no network cannot pull its registry image in-guest; the
+    // host fetches it instead. A restore resumes a guest that already has it.
+    if !from_snapshot {
+        record = smolvm::image_store::pin_for_start(
+            db,
+            name,
+            record,
+            &smolvm::registry::PullAuth::FromConfig,
+        )?;
+    }
+
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let mut resources = record.vm_resources();
@@ -2285,9 +2292,11 @@ fn check_port_conflicts(
     Ok(())
 }
 
-/// Start the default machine.
+/// Start the default machine when it has no record yet, creating its disks
+/// at the default sizes. A recorded default machine starts through
+/// [`start_vm_named`] with its own sizes.
 pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
-    let manager = AgentManager::new_default()?;
+    let manager = AgentManager::new_default_with_sizes(None, None)?;
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = format_pid_suffix(manager.child_pid());
@@ -2905,6 +2914,9 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // Keep the record until process death and storage removal are both confirmed,
     // so a failed delete remains visible and can be retried safely.
     remove_vm_data_and_record(&SmolvmDb::open()?, name, &data_dir)?;
+    // The machine may have held the last lease on a shared extraction.
+    #[cfg(target_os = "linux")]
+    smolvm::artifact_cache::log_trim(smolvm::artifact_cache::trim_unleased_shared_packs());
 
     // Once a child record and its VMM are both gone, its parent may have an old
     // RAM generation that no remaining clone references. Reap that generation
@@ -3141,7 +3153,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "overlay_gb": record.overlay_gb,
         "block_io": record.block_io,
         "disks": record.disks,
-        "image": record.image,
+        "image": record.display_image(),
         "entrypoint": record.entrypoint,
         "cmd": record.cmd,
         "ephemeral": record.ephemeral,

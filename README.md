@@ -21,6 +21,7 @@ Install
 -------
 
 ```bash
+brew install smol-machines/tap/smolvm                  # macOS (Homebrew)
 curl -sSL https://smolmachines.com/install.sh | bash   # macOS + Linux
 ```
 
@@ -82,7 +83,7 @@ smolvm machine checkpoint --name agent -o agent.checkpoint        # save it, pro
 smolvm machine create --name agent2 --from agent.checkpoint       # resume later or elsewhere
 ```
 
-Rewind to an earlier generation with `--from <checkpoint> --at '~N'` (see `machine checkpoint-log`), and stop without losing execution with [pause and resume](docs/pause-resume.md). More in [Branching](docs/branching.md) and [incremental checkpoints](docs/incremental-checkpoints.md).
+Rewind to an earlier generation with `--from <checkpoint> --at '~N'` (see `machine checkpoint-log`), and stop without losing execution with [pause and resume](docs/pause-resume.md). A checkpoint taken on an arm64 Mac resumes on arm64 Linux, see [Moving a running machine from a Mac to Linux](docs/mac-to-linux.md). More in [Branching](docs/branching.md) and [incremental checkpoints](docs/incremental-checkpoints.md).
 
 Portable
 --------
@@ -158,5 +159,7 @@ More
 * [GPU and CUDA](docs/gpu.md): Vulkan via virtio-gpu / Venus, and CUDA API remoting.
 * [Examples](examples/): python, node, docker-in-vm, local-llm, headless-browser, doom.
 * [Development](docs/DEVELOPMENT.md) · User docs at [smolmachines.com/docs](https://smolmachines.com/docs/), written in [smol-machines/docs](https://github.com/smol-machines/docs) (corrections welcome there; runtime bugs stay here).
+
+smolvm is the open-source runtime behind [smol machines](https://smolmachines.com), and is not affiliated with other projects named SmolVM.
 
 [Apache-2.0](LICENSE) · made by [@binsquare](https://github.com/BinSquare) · [twitter](https://x.com/binsquares) · [github](https://github.com/smol-machines/smolvm)

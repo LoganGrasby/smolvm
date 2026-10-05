@@ -539,6 +539,96 @@ fn parse_egress_denial_line(line: &str) -> Option<EgressDenial> {
     })
 }
 
+/// Per-VM egress signal log: `<vm_data_dir>/egress-signals.log`, where the
+/// virtio-net runtime records matches against the operator's egress watchlist.
+pub fn egress_signals_log_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(smolvm_network::EGRESS_SIGNALS_LOG)
+}
+
+/// Matches against the operator's egress watchlist for one label and
+/// destination, summarized from the machine's signal log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressSignal {
+    /// The watchlist entry's label, as written in the watchlist file.
+    pub label: String,
+    /// What matched: the name asked in a DNS question, or `ip:port`.
+    pub dest: String,
+    /// How many times it was recorded in the recent log. A repeat within a
+    /// minute is recorded once, so this counts minutes with activity, roughly.
+    pub count: u64,
+    /// First time it was recorded (RFC 3339), or empty when the line carried
+    /// no parseable timestamp.
+    pub first_at: String,
+    /// Latest time it was recorded, in the same form as `first_at`.
+    pub at: String,
+}
+
+/// The most label and destination pairs reported per machine, latest first.
+const EGRESS_SIGNALS_REPORTED: usize = 50;
+
+/// Summarize the watchlist matches recorded for `name`, latest first, or `None`
+/// when there are none (no watchlist, or nothing matched). Only the log's
+/// recent tail is read, bounding the work per machine-info call.
+pub fn read_egress_signals(name: &str) -> Option<Vec<EgressSignal>> {
+    read_egress_signals_at(&egress_signals_log_file(name))
+}
+
+fn read_egress_signals_at(path: &std::path::Path) -> Option<Vec<EgressSignal>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > EGRESS_DENIAL_SCAN_BYTES {
+        let _ = file.seek(SeekFrom::End(-(EGRESS_DENIAL_SCAN_BYTES as i64)));
+    }
+    let mut tail = String::new();
+    file.read_to_string(&mut tail).ok()?;
+    const MARKER: &str = "egress watch ";
+    let mut signals: Vec<EgressSignal> = Vec::new();
+    for line in tail.lines() {
+        let Some(at) = line.find(MARKER) else {
+            continue;
+        };
+        let Some((label, dest)) = line[at + MARKER.len()..].trim().split_once(' ') else {
+            continue;
+        };
+        let dest = dest.trim();
+        if label.is_empty() || dest.is_empty() {
+            continue;
+        }
+        let seen = line
+            .strip_prefix('[')
+            .and_then(|r| r.split_whitespace().next())
+            .unwrap_or("")
+            .trim_end_matches(':')
+            .trim_end_matches(']')
+            .to_string();
+        match signals
+            .iter_mut()
+            .find(|s| s.label == label && s.dest == dest)
+        {
+            Some(existing) => {
+                existing.count += 1;
+                existing.at = seen;
+            }
+            None => signals.push(EgressSignal {
+                label: label.to_string(),
+                dest: dest.to_string(),
+                count: 1,
+                first_at: seen.clone(),
+                at: seen,
+            }),
+        }
+    }
+    if signals.is_empty() {
+        return None;
+    }
+    // RFC 3339 in one zone sorts as text; latest first, then trim.
+    signals.sort_by(|a, b| b.at.cmp(&a.at));
+    signals.truncate(EGRESS_SIGNALS_REPORTED);
+    Some(signals)
+}
+
 /// How often the VM subprocess flushes its egress counter to disk. The control
 /// plane's egress rollup runs on a multi-minute cadence, so a value this small
 /// keeps the file comfortably fresh while writing only a few bytes.
@@ -851,6 +941,26 @@ fn enforce_external_interceptor_requirement(
     Ok(())
 }
 
+/// Which of a VM's launch settings differ from the requested ones.
+fn config_differences(
+    inner: &AgentInner,
+    mounts: &[HostMount],
+    ports: &[PortMapping],
+    resources: &VmResources,
+) -> Vec<&'static str> {
+    let mut differences = Vec::new();
+    if inner.mounts != mounts {
+        differences.push("mounts");
+    }
+    if inner.ports != ports {
+        differences.push("ports");
+    }
+    if inner.resources != *resources {
+        differences.push("resources");
+    }
+    differences
+}
+
 impl AgentManager {
     /// Create a new agent manager with explicit paths (low-level).
     ///
@@ -967,10 +1077,10 @@ impl AgentManager {
         Self::for_vm_with_sizes("default", storage_gb, overlay_gb)
     }
 
-    /// Get the default agent manager with default sizes.
-    ///
-    /// Canonicalized to `for_vm("default")` so that all lifecycle commands
-    /// use consistent socket/PID/storage paths.
+    /// Open the default machine to observe or reconnect to it, like
+    /// [`Self::for_vm`]: it creates nothing on disk, so it cannot launch a
+    /// machine that was never started. Launches use
+    /// [`Self::new_default_with_sizes`].
     pub fn new_default() -> Result<Self> {
         Self::for_vm("default")
     }
@@ -1195,6 +1305,22 @@ impl AgentManager {
     /// Get the current state of the agent.
     pub fn state(&self) -> AgentState {
         self.inner.lock().state
+    }
+
+    /// The launch settings a running VM differs in from `mounts`, `ports` and
+    /// `resources`, or `None` when it matches or its settings are not known.
+    pub fn running_config_differences(
+        &self,
+        mounts: &[HostMount],
+        ports: &[PortMapping],
+        resources: &VmResources,
+    ) -> Option<Vec<&'static str>> {
+        let inner = self.inner.lock();
+        if !matches!(inner.config_state, ConfigState::Known) {
+            return None;
+        }
+        let differences = config_differences(&inner, mounts, ports, resources);
+        (!differences.is_empty()).then_some(differences)
     }
 
     /// Check if the agent is running.
@@ -1655,7 +1781,8 @@ impl AgentManager {
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
         // so the comparison below is accurate even for detached VMs.
-        if self.try_connect_existing().is_some() {
+        let reachable = self.try_connect_existing().is_some();
+        if reachable {
             let inner = self.inner.lock();
             match &inner.config_state {
                 ConfigState::Known => {
@@ -1698,7 +1825,18 @@ impl AgentManager {
                     )?;
                 }
             }
-            tracing::info!("restarting agent VM due to configuration change");
+            let reason = {
+                let inner = self.inner.lock();
+                match (reachable, &inner.config_state) {
+                    (false, _) => "agent unreachable".to_string(),
+                    (true, ConfigState::Known) => format!(
+                        "{} changed",
+                        config_differences(&inner, &mounts, &ports, &resources).join(", ")
+                    ),
+                    (true, _) => "running config unknown".to_string(),
+                }
+            };
+            tracing::warn!(%reason, "restarting agent VM");
             self.stop()?;
         } else {
             // try_connect_existing failed but state may still be Running (crashed VM).
@@ -2533,6 +2671,11 @@ impl AgentManager {
             },
             pod_netns: features.pod_netns,
         };
+        // The operator's egress watchlist, copied beside the vsock socket where
+        // the network runtime looks for it (or a stale copy removed when none).
+        if let Some(dir) = self.vsock_socket.parent() {
+            super::egress_watchlist::provision(dir);
+        }
         let config_path = self
             .storage_disk
             .path()
@@ -2739,6 +2882,8 @@ impl AgentManager {
         // process::place_in_cgroup (VMM_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
         // =1024) as scope properties. Required placement fails closed.
         #[cfg(target_os = "linux")]
+        let mut adopted_scope = None;
+        #[cfg(target_os = "linux")]
         if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
             if let Some(name) = self.name() {
                 let budget = crate::process::vmm_memory_budget(
@@ -2760,10 +2905,16 @@ impl AgentManager {
                     self.abort_failed_launch(child_pid)?;
                     return Err(Error::agent("adopt VM scope", e.to_string()));
                 }
+                adopted_scope = Some(name);
             }
         }
 
-        self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config)
+        let launched = self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config);
+        #[cfg(target_os = "linux")]
+        if let (Err(_), Some(name)) = (&launched, adopted_scope) {
+            release_failed_launch_scope(name, child_pid);
+        }
+        launched
     }
 
     /// Like `ensure_running_with_full_config` but uses subprocess launch.
@@ -2778,7 +2929,8 @@ impl AgentManager {
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running (same logic as ensure_running_with_full_config)
-        if self.try_connect_existing().is_some() {
+        let reachable = self.try_connect_existing().is_some();
+        if reachable {
             let inner = self.inner.lock();
             match &inner.config_state {
                 ConfigState::Known => {
@@ -2815,7 +2967,18 @@ impl AgentManager {
                     )?;
                 }
             }
-            tracing::info!("restarting agent VM due to configuration change");
+            let reason = {
+                let inner = self.inner.lock();
+                match (reachable, &inner.config_state) {
+                    (false, _) => "agent unreachable".to_string(),
+                    (true, ConfigState::Known) => format!(
+                        "{} changed",
+                        config_differences(&inner, &mounts, &ports, &resources).join(", ")
+                    ),
+                    (true, _) => "running config unknown".to_string(),
+                }
+            };
+            tracing::warn!(%reason, "restarting agent VM");
             self.stop()?;
         } else {
             self.reset_stale_running_state();
@@ -3510,6 +3673,27 @@ fn refuse_live_launch_pid(pid: crate::process::Pid) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Stop the scope a failed launch adopted its VM process into.
+///
+/// A VM process that exits before systemd moves it (a refused start such as a
+/// published port already in use) leaves a scope whose cgroup was never
+/// populated; systemd never sees it empty, so it would stay active with no
+/// processes. The scope is stopped only once that process is confirmed dead,
+/// so it can hold nothing else of this machine's.
+#[cfg(target_os = "linux")]
+fn release_failed_launch_scope(name: &str, child_pid: i32) {
+    if process::is_alive(child_pid) {
+        tracing::warn!(
+            pid = child_pid,
+            "failed launch's VM process is still alive; keeping its scope"
+        );
+        return;
+    }
+    if let Err(error) = crate::systemd_scope::stop_scope(name) {
+        tracing::warn!(machine = name, %error, "could not stop the scope of a failed launch");
+    }
 }
 
 impl Drop for AgentManager {
@@ -4373,5 +4557,45 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(features.packed_layers_dir.is_none());
+    }
+}
+
+#[cfg(test)]
+mod egress_signal_tests {
+    use super::read_egress_signals_at;
+
+    #[test]
+    fn matches_are_grouped_by_label_and_destination_latest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("egress-signals.log");
+        std::fs::write(
+            &log,
+            "[2026-10-03T21:01:00Z]: egress watch w1 a.watched.example\n\
+             [2026-10-03T21:02:00Z]: unrelated line\n\
+             [2026-10-03T21:03:00Z]: egress watch w2 192.0.2.7:443\n\
+             [2026-10-03T21:04:00Z]: egress watch w1 a.watched.example\n",
+        )
+        .unwrap();
+        let signals = read_egress_signals_at(&log).unwrap();
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].label, "w1");
+        assert_eq!(signals[0].dest, "a.watched.example");
+        assert_eq!(signals[0].count, 2);
+        assert_eq!(signals[0].first_at, "2026-10-03T21:01:00Z");
+        assert_eq!(signals[0].at, "2026-10-03T21:04:00Z");
+        assert_eq!(signals[1].dest, "192.0.2.7:443");
+    }
+
+    #[test]
+    fn no_log_or_no_matches_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("egress-signals.log");
+        assert!(read_egress_signals_at(&log).is_none());
+        std::fs::write(
+            &log,
+            "[2026-10-03T21:02:00Z]: egress policy denied connect to 192.0.2.7:443\n",
+        )
+        .unwrap();
+        assert!(read_egress_signals_at(&log).is_none());
     }
 }

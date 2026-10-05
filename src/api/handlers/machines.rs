@@ -80,7 +80,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     MachineInfo {
         runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name: name.to_string(),
-        image: record.image.clone(),
+        image: record.display_image().map(str::to_string),
         state: actual_state.to_string(),
         cpus: record.cpus,
         mem: record.mem,
@@ -132,6 +132,9 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // flushes. Surfaced here so the control plane reads it from the machine
         // list exactly like disk size — no bespoke endpoint.
         egress_bytes: crate::agent::read_egress_telemetry(name),
+        // Watchlist matches from the signal log the network stack writes, so
+        // the control plane reads them from the machine list it already polls.
+        egress_signals: crate::agent::read_egress_signals(name),
         // Live consumed CPU-seconds for the VMM child, sampled from the host
         // (user+system CPU time). Resets on restart — the control plane treats it
         // as a monotonic-with-resets counter and accumulates the durable total.
@@ -488,6 +491,191 @@ fn checkpoint_cache_evict(dir: &std::path::Path, max: u64) {
             total = total.saturating_sub(size);
             tracing::info!(path = %path.display(), "evicted checkpoint from the node-local cache");
         }
+    }
+}
+
+/// One cache take of a checkpoint, shared by every restore of it that overlaps.
+///
+/// Each take links a fresh alias of the cached artifact, and every link or
+/// unlink changes the inode's ctime, which voids the verifications other
+/// restores just made: a burst of N restores of one checkpoint then re-hashed
+/// the whole artifact N times, one after another under the cache locks.
+/// Restores that arrive while a take is alive reuse its pinned, verified alias
+/// instead, so the inode stays still and its proofs keep holding. The alias is
+/// released when the last of them finishes.
+struct SharedCheckpointTake {
+    _transfer: CheckpointTransfer,
+    artifact: std::path::PathBuf,
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+}
+
+type SharedTakeSlot = std::sync::Arc<tokio::sync::Mutex<std::sync::Weak<SharedCheckpointTake>>>;
+
+static SHARED_CHECKPOINT_TAKES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SharedTakeSlot>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// How long a checkpoint's take outlives its last restore. A restore that links
+/// a new alias changes the inode's ctime and so re-hashes the whole artifact;
+/// restores minutes apart reuse the same take instead and skip that work.
+const SHARED_TAKE_LINGER: Duration = Duration::from_secs(300);
+
+/// At most this many takes linger, bounding the disk their pinned links hold.
+const SHARED_TAKE_LINGER_MAX: usize = 8;
+
+type LingeringTakes =
+    std::collections::HashMap<String, (std::sync::Arc<SharedCheckpointTake>, std::time::Instant)>;
+
+/// Takes kept alive past their last restore, with when they were last used.
+static LINGERING_CHECKPOINT_TAKES: std::sync::LazyLock<std::sync::Mutex<LingeringTakes>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Keep `take` alive for [`SHARED_TAKE_LINGER`], dropping expired takes and,
+/// past [`SHARED_TAKE_LINGER_MAX`], the least recently used one.
+fn linger_checkpoint_take(key: &str, take: &std::sync::Arc<SharedCheckpointTake>) {
+    let mut lingering = LINGERING_CHECKPOINT_TAKES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    lingering.retain(|_, (_, used)| now.duration_since(*used) < SHARED_TAKE_LINGER);
+    lingering.insert(key.to_string(), (take.clone(), now));
+    while lingering.len() > SHARED_TAKE_LINGER_MAX {
+        let Some(oldest) = lingering
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        lingering.remove(&oldest);
+    }
+}
+
+/// Release lingering takes once idle, so their links free disk without
+/// waiting for the next restore to prune them.
+fn spawn_checkpoint_take_reaper() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async {
+                loop {
+                    tokio::time::sleep(SHARED_TAKE_LINGER / 4).await;
+                    let expired: Vec<_> = {
+                        let mut lingering = LINGERING_CHECKPOINT_TAKES
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let now = std::time::Instant::now();
+                        let keys: Vec<String> = lingering
+                            .iter()
+                            .filter(|(_, (_, used))| {
+                                now.duration_since(*used) >= SHARED_TAKE_LINGER
+                            })
+                            .map(|(key, _)| key.clone())
+                            .collect();
+                        keys.into_iter()
+                            .filter_map(|key| lingering.remove(&key))
+                            .collect()
+                    };
+                    // The take's cleanup locks and unlinks, so it runs off the runtime.
+                    if !expired.is_empty() {
+                        let _ = tokio::task::spawn_blocking(move || drop(expired)).await;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// The live take of `key`, or a new one from the node-local cache; `None` on a miss.
+async fn shared_checkpoint_take(
+    key: &str,
+) -> Result<Option<std::sync::Arc<SharedCheckpointTake>>, ApiError> {
+    let slot = {
+        let mut slots = SHARED_CHECKPOINT_TAKES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Forget slots nobody holds or waits on whose take has ended.
+        slots.retain(|_, slot| {
+            std::sync::Arc::strong_count(slot) > 1
+                || slot.try_lock().map_or(true, |take| take.strong_count() > 0)
+        });
+        slots.entry(key.to_string()).or_default().clone()
+    };
+    // Held across the take so overlapping restores of `key` wait for it
+    // rather than each linking an alias of their own.
+    let mut live = slot.lock().await;
+    spawn_checkpoint_take_reaper();
+    if let Some(take) = live.upgrade() {
+        linger_checkpoint_take(key, &take);
+        return Ok(Some(take));
+    }
+    let transfer = tempfile::Builder::new()
+        .prefix("checkpoint-restore-")
+        .tempdir_in(checkpoint_transfer_root()?)
+        .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
+    let artifact = transfer.path().join("upload.smolcheckpoint");
+    let transfer = CheckpointTransfer {
+        _directory: Some(transfer),
+        artifact: artifact.clone(),
+    };
+    let cached = {
+        let (key, artifact) = (key.to_string(), artifact.clone());
+        tokio::task::spawn_blocking(move || checkpoint_cache_take(&key, &artifact))
+            .await
+            .map_err(|error| ApiError::internal(format!("checkpoint cache task: {error}")))?
+    };
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    let take = std::sync::Arc::new(SharedCheckpointTake {
+        _transfer: transfer,
+        artifact,
+        verified: cached.verified,
+    });
+    *live = std::sync::Arc::downgrade(&take);
+    linger_checkpoint_take(key, &take);
+    Ok(Some(take))
+}
+
+/// Hashes a checkpoint on a blocking thread as it is received, so verifying
+/// it and naming it by SHA-256 need no further read of the written file.
+/// Best-effort: if hashing stops, the artifact is simply verified by reading it.
+struct ReceiveHasher {
+    sender: Option<tokio::sync::mpsc::Sender<axum::body::Bytes>>,
+    task: tokio::task::JoinHandle<smolvm_pack::extract::ReceivedArtifactHashes>,
+}
+
+impl ReceiveHasher {
+    fn spawn() -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<axum::body::Bytes>(64);
+        let task = tokio::task::spawn_blocking(move || {
+            let mut hasher = smolvm_pack::extract::ArtifactStreamHasher::new();
+            while let Some(chunk) = receiver.blocking_recv() {
+                hasher.update(&chunk);
+            }
+            hasher.finish()
+        });
+        Self {
+            sender: Some(sender),
+            task,
+        }
+    }
+
+    /// Queue the next received bytes; waits while the hasher is behind, so
+    /// memory stays bounded.
+    async fn update(&mut self, chunk: axum::body::Bytes) {
+        if let Some(sender) = &self.sender {
+            if sender.send(chunk).await.is_err() {
+                self.sender = None;
+            }
+        }
+    }
+
+    /// Hashes of everything queued, or `None` if hashing stopped early.
+    async fn finish(mut self) -> Option<smolvm_pack::extract::ReceivedArtifactHashes> {
+        let complete = self.sender.take().is_some();
+        let hashes = (&mut self.task).await.ok()?;
+        complete.then_some(hashes)
     }
 }
 
@@ -977,11 +1165,69 @@ async fn upload_checkpoint(
     artifact: &std::path::Path,
     urls: Vec<reqwest::Url>,
 ) -> Result<u64, ApiError> {
-    use tokio::io::AsyncSeekExt;
-    let size = tokio::fs::metadata(artifact)
+    let file = std::fs::File::open(artifact)
+        .map_err(|error| ApiError::internal(format!("open checkpoint artifact: {error}")))?;
+    upload_checkpoint_file(file, urls).await
+}
+
+/// Read `length` bytes at `offset` of `file` as a body stream, positionally, so
+/// parts uploading at once never share a cursor and the descriptor's file may
+/// already be unlinked.
+fn checkpoint_part_stream(
+    file: Arc<std::fs::File>,
+    offset: u64,
+    length: u64,
+) -> impl futures_util::Stream<Item = std::io::Result<axum::body::Bytes>> {
+    const CHUNK: u64 = 1024 * 1024;
+    futures_util::stream::try_unfold((file, offset, length), |(file, offset, left)| async move {
+        if left == 0 {
+            return Ok(None);
+        }
+        let want = left.min(CHUNK) as usize;
+        let reader = file.clone();
+        let chunk = tokio::task::spawn_blocking(move || {
+            let mut buffer = vec![0_u8; want];
+            let mut filled = 0;
+            while filled < want {
+                #[cfg(unix)]
+                let read = std::os::unix::fs::FileExt::read_at(
+                    &*reader,
+                    &mut buffer[filled..],
+                    offset + filled as u64,
+                )?;
+                #[cfg(windows)]
+                let read = std::os::windows::fs::FileExt::seek_read(
+                    &*reader,
+                    &mut buffer[filled..],
+                    offset + filled as u64,
+                )?;
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "checkpoint artifact shrank during upload",
+                    ));
+                }
+                filled += read;
+            }
+            Ok(axum::body::Bytes::from(buffer))
+        })
         .await
+        .map_err(std::io::Error::other)??;
+        let read = chunk.len() as u64;
+        Ok(Some((chunk, (file, offset + read, left - read))))
+    })
+}
+
+/// Upload an open checkpoint artifact to `urls` in contiguous parts at once.
+async fn upload_checkpoint_file(
+    file: std::fs::File,
+    urls: Vec<reqwest::Url>,
+) -> Result<u64, ApiError> {
+    let size = file
+        .metadata()
         .map_err(|error| ApiError::internal(format!("stat checkpoint artifact: {error}")))?
         .len();
+    let file = Arc::new(file);
     // Same policy as the restore fetch: no redirects, so the host allow-list
     // cannot be escaped by a 302.
     let client = reqwest::Client::builder()
@@ -997,18 +1243,10 @@ async fn upload_checkpoint(
             .enumerate()
             .map(|(index, (url, (start, length)))| {
                 let client = client.clone();
+                let file = file.clone();
                 async move {
-                    let mut file = tokio::fs::File::open(artifact).await.map_err(|error| {
-                        ApiError::internal(format!("open checkpoint artifact: {error}"))
-                    })?;
-                    file.seek(std::io::SeekFrom::Start(start))
-                        .await
-                        .map_err(|error| {
-                            ApiError::internal(format!("seek checkpoint artifact: {error}"))
-                        })?;
-                    let body = reqwest::Body::wrap_stream(
-                        tokio_util::io::ReaderStream::with_capacity(file.take(length), 1024 * 1024),
-                    );
+                    let body =
+                        reqwest::Body::wrap_stream(checkpoint_part_stream(file, start, length));
                     let response = client
                         .put(url)
                         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -1111,7 +1349,33 @@ fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
 
 #[cfg(test)]
 mod checkpoint_upload_tests {
-    use super::{checked_upload_urls, upload_part_ranges};
+    use super::{checked_upload_urls, checkpoint_part_stream, upload_part_ranges};
+
+    /// Parts read at once from one descriptor reassemble the file exactly, even
+    /// after its name is gone, as when a resume consumes a paused checkpoint.
+    #[tokio::test]
+    async fn concurrent_parts_reassemble_an_unlinked_artifact() {
+        use futures_util::TryStreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        let content: Vec<u8> = (0..5_000_003_u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &content).unwrap();
+        let file = std::sync::Arc::new(std::fs::File::open(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        let ranges = upload_part_ranges(content.len() as u64, 4);
+        let parts = futures_util::future::try_join_all(ranges.iter().map(|&(start, length)| {
+            checkpoint_part_stream(file.clone(), start, length).try_fold(
+                Vec::new(),
+                |mut acc, chunk| async move {
+                    acc.extend_from_slice(&chunk);
+                    Ok(acc)
+                },
+            )
+        }))
+        .await
+        .unwrap();
+        assert_eq!(parts.concat(), content);
+    }
 
     #[test]
     fn part_ranges_cover_the_artifact_exactly_once() {
@@ -1471,30 +1735,40 @@ pub async fn restore_portable_checkpoint(
         .transpose()
         .map_err(|error| ApiError::BadRequest(format!("invalid restore ports: {error}")))?
         .unwrap_or_default();
-    let transfer = tempfile::Builder::new()
-        .prefix("checkpoint-restore-")
-        .tempdir_in(checkpoint_transfer_root()?)
-        .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
-    let artifact = transfer.path().join("upload.smolcheckpoint");
-    let _transfer = CheckpointTransfer {
-        _directory: Some(transfer),
-        artifact: artifact.clone(),
+    // A cached artifact is hard-linked straight into a staging directory:
+    // nothing is created or fetched, and the cache's own inode is untouched by
+    // whatever the restore does with its copy. Overlapping restores of the same
+    // checkpoint share one such link (see `SharedCheckpointTake`).
+    let shared_take = match options.cache_key.as_deref() {
+        Some(key) => shared_checkpoint_take(key).await?,
+        None => None,
+    };
+    let cache_hit = shared_take.is_some();
+    // Each request owns its own descriptor of the shared proof.
+    let verified = shared_take
+        .as_ref()
+        .and_then(|take| take.verified.as_ref())
+        .and_then(|proof| proof.try_clone().ok());
+    // A miss uploads into a staging directory of this request's own.
+    let (artifact, _transfer) = match &shared_take {
+        Some(take) => (take.artifact.clone(), None),
+        None => {
+            let transfer = tempfile::Builder::new()
+                .prefix("checkpoint-restore-")
+                .tempdir_in(checkpoint_transfer_root()?)
+                .map_err(|error| {
+                    ApiError::internal(format!("create checkpoint transfer: {error}"))
+                })?;
+            let artifact = transfer.path().join("upload.smolcheckpoint");
+            let transfer = CheckpointTransfer {
+                _directory: Some(transfer),
+                artifact: artifact.clone(),
+            };
+            (artifact, Some(transfer))
+        }
     };
     let limit = max_checkpoint_upload_bytes();
-    // A cached artifact is hard-linked straight into the staging directory:
-    // nothing is created or fetched, and the cache's own inode is untouched by
-    // whatever the restore does with its copy. Checked before any file exists
-    // at `artifact`, since a link cannot land on an existing path.
-    let cached = if let Some(key) = options.cache_key.clone() {
-        let artifact = artifact.clone();
-        tokio::task::spawn_blocking(move || checkpoint_cache_take(&key, &artifact))
-            .await
-            .map_err(|error| ApiError::internal(format!("checkpoint cache task: {error}")))?
-    } else {
-        None
-    };
-    let cache_hit = cached.is_some();
-    let verified = cached.and_then(|entry| entry.verified);
+    let mut received_hashes = None;
     let received: u64 = if cache_hit {
         std::fs::metadata(&artifact).map(|m| m.len()).unwrap_or(0)
     } else {
@@ -1504,6 +1778,11 @@ pub async fn restore_portable_checkpoint(
             .open(&artifact)
             .await
             .map_err(|error| ApiError::internal(format!("create checkpoint upload: {error}")))?;
+        // Checked once the file exists and again once it is complete: only a
+        // file nobody else could write between the two is verified from the
+        // bytes as they were received instead of being read back.
+        let service_only = smolvm_pack::extract::only_service_can_write(&artifact);
+        let mut hasher = ReceiveHasher::spawn();
         let mut received = 0_u64;
         if let Some(raw) = options.source_url.as_deref() {
             // Pull the checkpoint ourselves. `none()` redirects: a signed URL needs
@@ -1550,6 +1829,7 @@ pub async fn restore_portable_checkpoint(
                 file.write_all(&chunk)
                     .await
                     .map_err(|error| ApiError::internal(format!("write checkpoint: {error}")))?;
+                hasher.update(chunk).await;
             }
         } else {
             let mut body = request.into_body().into_data_stream();
@@ -1568,15 +1848,19 @@ pub async fn restore_portable_checkpoint(
                 file.write_all(&chunk).await.map_err(|error| {
                     ApiError::internal(format!("write checkpoint upload: {error}"))
                 })?;
+                hasher.update(chunk).await;
             }
         }
         file.flush()
             .await
             .map_err(|error| ApiError::internal(format!("flush checkpoint upload: {error}")))?;
-        file.sync_all()
-            .await
-            .map_err(|error| ApiError::internal(format!("sync checkpoint upload: {error}")))?;
+        // No fsync: this file only carries the checkpoint into extraction and
+        // is removed afterwards. Everything installed from it is made durable
+        // where it is installed, and a node cache entry made from it is
+        // verified on every later use, so forcing it to disk first only made
+        // the restore wait for a write nothing depends on.
         drop(file);
+        received_hashes = hasher.finish().await.map(|hashes| (hashes, service_only));
         received
     };
     if received > limit {
@@ -1589,6 +1873,19 @@ pub async fn restore_portable_checkpoint(
             "checkpoint upload is empty".to_string(),
         ));
     }
+    // A miss was hashed while it arrived; when that covers what the footer
+    // checksum covers, creation uses it instead of reading the file again.
+    let verified = match received_hashes {
+        Some((hashes, service_only)) => {
+            let artifact = artifact.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::portable_checkpoint::verified_from_received(&artifact, &hashes, service_only)
+            })
+            .await
+            .map_err(|error| ApiError::internal(format!("checkpoint verification task: {error}")))?
+        }
+        None => verified,
+    };
 
     // Prepared state is an optional optimization: eviction or missing metadata
     // falls back to the durable artifact before machine creation starts.
@@ -1625,7 +1922,14 @@ pub async fn restore_portable_checkpoint(
     let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
+    // The restore no longer leases the checkpoint's shared extraction.
+    #[cfg(target_os = "linux")]
     if result.is_ok() {
+        crate::artifact_cache::trim_unleased_shared_packs_soon();
+    }
+    // A hit is already cached; re-linking it would only change the inode's
+    // ctime under the restores still sharing it.
+    if result.is_ok() && !cache_hit {
         if let Some(key) = options.cache_key {
             if let Err(error) =
                 tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact)).await
@@ -2078,6 +2382,9 @@ async fn create_machine_inner(
         None => None,
     };
 
+    // SHA-256 taken while a restored checkpoint was received, handed to the
+    // shared extraction so it does not hash the artifact again.
+    let mut received_digest: Option<smolvm_pack::extract::ArtifactDigestProof> = None;
     // If --from is set, read manifest and extract sidecar
     let (
         image,
@@ -2104,23 +2411,25 @@ async fn create_machine_inner(
         // have changed link metadata in between; reverify under the same lease
         // used by lookup, publication, eviction and transfer cleanup.
         let verification_path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        received_digest = tokio::task::spawn_blocking(move || {
             let _lock = if cached_checkpoint {
                 Some(lock_checkpoint_cache_verification(&checkpoint_cache_dir()?)
                     .map_err(|e| ApiError::internal(format!("lock checkpoint verification: {e}")))?)
             } else {
                 None
             };
-            if verified.as_ref().is_some_and(|input| input.covers(&verification_path)) {
+            let mut digest = None;
+            if let Some(input) = verified.as_ref().filter(|input| input.covers(&verification_path)) {
                 tracing::info!(
                     artifact = %verification_path.display(),
                     "reusing this request's pinned checkpoint verification; skipping a second checksum pass"
                 );
+                digest = input.digest_proof();
             } else {
                 crate::portable_checkpoint::verified_sidecar_footer(&verification_path)
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             }
-            Ok::<_, ApiError>(())
+            Ok::<_, ApiError>(digest)
         }).await.map_err(|e| ApiError::internal(format!("checkpoint verification task: {e}")))??;
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
@@ -2388,11 +2697,20 @@ async fn create_machine_inner(
     if let Some(ref sidecar_path) = source_smolmachine {
         let name = name.clone();
         let sidecar_path = sidecar_path.clone();
+        let digest = received_digest.take();
         tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
             let path = std::path::Path::new(&sidecar_path);
             let cache_dir = crate::agent::machine_layers_cache_dir(&name);
-            let result = crate::portable_checkpoint::materialize_pack_layers(&name, path)
-                .map_err(|e| ApiError::internal(e.to_string()));
+            // The server outlives the restore, so checkpoint RAM can finish
+            // reaching the disk after the machine is created.
+            let options = smolvm_pack::extract::SharedExtractOptions {
+                digest,
+                defer_memory_sync: true,
+            };
+            let result = crate::portable_checkpoint::materialize_pack_layers_with_options(
+                &name, path, options,
+            )
+            .map_err(|e| ApiError::internal(e.to_string()));
             // Detach the case-sensitive volume mounted during extraction so a
             // created-but-unstarted machine leaves nothing mounted, and so the
             // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
@@ -2489,17 +2807,24 @@ async fn create_machine_inner(
             let cache_dir = crate::agent::machine_layers_cache_dir(&name_for_checkpoint);
             let content_dir = crate::agent::read_shared_pack_pointer(&cache_dir)
                 .unwrap_or_else(|| cache_dir.clone());
-            crate::portable_checkpoint::install(
+            // RAM the extraction left for later reaches the disk after this
+            // install, whether or not it succeeds, so it does not slow it down.
+            let mut deferred =
+                crate::portable_checkpoint::DeferredRestoreSync::for_extraction(&content_dir);
+            let installed = crate::portable_checkpoint::install_deferring_sync(
                 &content_dir,
                 &vm_data_dir(&name_for_checkpoint),
                 &checkpoint,
+                &mut deferred,
             )
             .and_then(|()| {
                 crate::portable_checkpoint::discard_transport_pack(&vm_data_dir(
                     &name_for_checkpoint,
                 ))
             })
-            .map_err(|error| ApiError::BadRequest(error.to_string()))
+            .map_err(|error| ApiError::BadRequest(error.to_string()));
+            deferred.start();
+            installed
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))?;
@@ -2549,6 +2874,25 @@ async fn create_machine_inner(
             Err(error) => {
                 let _ = std::fs::remove_dir_all(vm_data_dir(&name));
                 return Err(error);
+            }
+        }
+    }
+
+    // A checkpoint of a machine that booted a host-fetched registry image needs
+    // that image fetched here and served the way the captured guest read it,
+    // whatever the restored machine's network: the guest holds its device.
+    let mut restored_host_image = None;
+    if let Some(checkpoint) = manifest_checkpoint.as_ref() {
+        match crate::portable_checkpoint::fetch_checkpoint_host_image(
+            checkpoint,
+            &crate::registry::PullAuth::FromConfig,
+        )
+        .await
+        {
+            Ok(image) => restored_host_image = image,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(vm_data_dir(&name));
+                return Err(ApiError::from(error));
             }
         }
     }
@@ -2649,7 +2993,14 @@ async fn create_machine_inner(
         forkable: manifest_checkpoint.is_some(),
         init_completed: manifest_checkpoint.is_some(),
         docker_socket: req.docker_socket,
-        image,
+        image: match &restored_host_image {
+            Some(restored) => Some(restored.local.clone()),
+            None => image,
+        },
+        image_origin: restored_host_image
+            .as_ref()
+            .map(|restored| restored.origin.clone()),
+        image_origin_digest: restored_host_image.map(|restored| restored.digest),
         source_registry_ref: if manifest_checkpoint.is_some() {
             restored_pack
                 .as_ref()
@@ -3121,6 +3472,31 @@ pub async fn start_machine(
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
     }
 
+    // A machine with no network cannot pull its registry image in-guest; the
+    // host fetches it instead, authorized with the credentials this start
+    // carries, as the guest's pull would be. A restore resumes a guest that
+    // already has its image.
+    if record.image_needs_host_fetch()
+        && crate::portable_checkpoint::pending_dir(&vm_data_dir(&name)).is_none()
+    {
+        let auth = match &registry_auth {
+            Some(auth) => crate::registry::PullAuth::Basic {
+                username: auth.username.clone(),
+                password: auth.password.clone(),
+            },
+            None => crate::registry::PullAuth::FromConfig,
+        };
+        let image = record.image.clone().unwrap_or_default();
+        let fetched = crate::image_store::fetch_image_archive(&image, &auth).await?;
+        record.pin_host_fetched_image(fetched.local.clone(), fetched.digest.clone());
+        state
+            .update_vm(&name, move |r| {
+                r.pin_host_fetched_image(fetched.local, fetched.digest)
+            })
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    }
+
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let resources = record.vm_resources();
@@ -3136,6 +3512,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let launch_image = record.image.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let credential_launch = crate::credentials::CredentialLaunch::for_record(&name, &record);
     let record_golden = record.golden.clone();
@@ -3199,6 +3576,7 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            launch_image.as_deref(),
             dns_filter_hosts,
             credential_launch,
         )
@@ -4115,6 +4493,7 @@ async fn boot_prepared_fork_inner(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
+            record.image.as_deref(),
             record.dns_filter_hosts.clone(),
             crate::credentials::CredentialLaunch::for_record(&clone_b, &record),
         )
@@ -4336,6 +4715,9 @@ pub async fn release_held_fork(
 pub struct PauseOperationQuery {
     /// The same identifier must be reused for all attempts of one pause.
     pub operation_id: Option<String>,
+    /// JSON array of pre-signed object-store URLs to upload the saved execution
+    /// to in parallel parts, as a capture does, instead of streaming it back.
+    pub upload_urls: Option<String>,
 }
 
 /// Save execution durably before stopping the machine.
@@ -4418,6 +4800,11 @@ pub async fn paused_checkpoint(
     Path(name): Path<String>,
     Query(query): Query<PauseOperationQuery>,
 ) -> Result<Response<Body>, ApiError> {
+    let upload_urls = query
+        .upload_urls
+        .as_deref()
+        .map(checked_upload_urls)
+        .transpose()?;
     let guard = state.lifecycle_lock(&name).lock_owned().await;
     let file = tokio::task::spawn_blocking(move || {
         let _guard = guard;
@@ -4452,9 +4839,17 @@ pub async fn paused_checkpoint(
     })
     .await?
     .map_err(ApiError::from)?;
-    let size = file.metadata().map_err(ApiError::internal)?.len();
     // The open descriptor survives deletion of the machine or a concurrent
     // resume; downloading never takes ownership of its recovery artifact.
+    if let Some(urls) = upload_urls {
+        // Straight to the store, so the artifact never crosses the control
+        // plane: relaying it there cost a full copy, an fsync and one stream.
+        let size = upload_checkpoint_file(file, urls).await?;
+        return Ok(axum::response::IntoResponse::into_response(Json(
+            serde_json::json!({ "uploaded": true, "sizeBytes": size }),
+        )));
+    }
+    let size = file.metadata().map_err(ApiError::internal)?.len();
     Response::builder()
         .header(
             header::CONTENT_TYPE,
@@ -5085,6 +5480,9 @@ async fn delete_one_transaction(
             })?;
         return Err(error);
     }
+    // The machine may have held the last lease on a shared extraction.
+    #[cfg(target_os = "linux")]
+    crate::artifact_cache::trim_unleased_shared_packs_soon();
 
     if let Some(parent) = record.golden.clone() {
         let db = state.db().clone();
