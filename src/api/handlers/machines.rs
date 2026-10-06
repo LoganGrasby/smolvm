@@ -4842,7 +4842,11 @@ pub async fn paused_checkpoint(
             )
         })?;
         crate::portable_checkpoint::verified_sidecar_footer(&path)?;
-        std::fs::File::open(path).map_err(SmolvmError::from)
+        // A download leaves the host, so it carries the layers a pause pinned.
+        crate::portable_checkpoint::exportable_paused_artifact(
+            &crate::agent::vm_data_dir(&name),
+            &path,
+        )
     })
     .await?
     .map_err(ApiError::from)?;
@@ -5305,6 +5309,10 @@ fn remove_machine_data_and_record(
                     "failed to remove data for machine '{name}': {error}; repair host storage and retry deletion"
                 ))
             })?;
+            // Layers a pause pinned beside the data directory go with it.
+            if let Err(error) = crate::portable_checkpoint::remove_paused_layers(data_dir) {
+                tracing::warn!(machine = name, %error, "could not remove pinned layers");
+            }
         }
         // Storage may already be gone after an interrupted delete or DB failure.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
