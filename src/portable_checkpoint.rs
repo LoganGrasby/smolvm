@@ -1670,6 +1670,14 @@ impl DeferredRetain {
     }
 }
 
+/// Whether the VMM declined a deferred RAM save in a way a synchronous SAVE
+/// covers: it lacks the command, or the guest's RAM cannot be retained as a
+/// generation (a fork clone's). A stored checkpoint ingests a synchronous
+/// SAVE's RAM image as well as a streamed one, so the store needs no exception.
+fn declined_deferred_save(reply: &str) -> bool {
+    reply.starts_with("ERR ENOTSUP") || reply.trim() == "ERR EINVAL unknown command"
+}
+
 fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1973,12 +1981,7 @@ fn capture_with_completion(
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     // A packed machine whose held save failed goes back to SAVE, never to the
     // rebasing PREPARE_SAVE.
-    if !prepared
-        && (held_in_place
-            || (options.store_dir.is_none()
-                && (reply.starts_with("ERR ENOTSUP")
-                    || reply.trim() == "ERR EINVAL unknown command")))
-    {
+    if !prepared && (held_in_place || declined_deferred_save(&reply)) {
         reply = synchronous_save()?;
         tracing::info!(machine = name, command = "SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
     }
@@ -5265,6 +5268,17 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_declined_deferred_save_falls_back_to_a_synchronous_one() {
+        // libkrun's reply for a fork clone, whose RAM has no file generation.
+        assert!(declined_deferred_save(
+            "ERR ENOTSUP deferred durable save requires file-backed guest RAM\n"
+        ));
+        assert!(declined_deferred_save("ERR EINVAL unknown command\n"));
+        assert!(!declined_deferred_save("OK prepared\n"));
+        assert!(!declined_deferred_save("ERR EIO save failed\n"));
+    }
+
     #[test]
     fn a_node_policy_recorded_by_a_server_is_what_other_processes_use() {
         let root = tempfile::tempdir().unwrap();
